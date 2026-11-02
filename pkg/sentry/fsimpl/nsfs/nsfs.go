@@ -62,6 +62,8 @@ func NewFilesystem(vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error) {
 		devMinor: devMinor,
 	}
 	fs.Filesystem.VFSFilesystem().Init(vfsObj, filesystemType{}, fs)
+	// Kernel-internal filesystem (Linux SB_NOUSER) for fanotify.
+	fs.Filesystem.VFSFilesystem().SetFanotifyFlags(vfs.FanotifyNoUser)
 	return fs.Filesystem.VFSFilesystem(), nil
 }
 

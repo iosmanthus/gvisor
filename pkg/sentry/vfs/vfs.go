@@ -225,6 +225,7 @@ func (vfs *VirtualFilesystem) Init(ctx context.Context) error {
 		devMinor: anonfsDevMinor,
 	}
 	anonfs.vfsfs.Init(vfs, &anonFilesystemType{}, &anonfs)
+	anonfs.vfsfs.SetFanotifyFlags(FanotifyNoUser)
 	defer anonfs.vfsfs.DecRef(ctx)
 	anonMount := vfs.NewDisconnectedMount(&anonfs.vfsfs, nil, &MountOptions{})
 	vfs.anonMount = anonMount

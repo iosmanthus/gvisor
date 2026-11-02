@@ -109,6 +109,8 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 	procfs.MaxCachedDentries = maxCachedDentries
 	procfs.NoNegativeDentries = true
 	procfs.VFSFilesystem().Init(vfsObj, &ft, procfs)
+	// Linux procfs has FS_DISALLOW_NOTIFY_PERM.
+	procfs.VFSFilesystem().SetFanotifyFlags(vfs.FanotifyNoPermEvents)
 
 	var internalData *InternalData
 	if opts.InternalData == nil {

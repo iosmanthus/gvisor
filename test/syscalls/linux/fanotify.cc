@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/fanotify.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -28,8 +30,10 @@
 #include "gtest/gtest.h"
 #include "absl/strings/str_cat.h"
 #include "test/util/capability_util.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/mount_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -186,6 +190,164 @@ TEST(FanotifyTest, InitFdFlagsAndName) {
   char buf[64];
   EXPECT_THAT(read(g.get(), buf, sizeof(buf)), SyscallFailsWithErrno(EAGAIN));
   EXPECT_THAT(read(g.get(), buf, 1), SyscallFailsWithErrno(EAGAIN));
+}
+
+TEST(FanotifyTest, MarkValidation) {
+  SkipIfNoSysAdmin();
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_NOTIF, O_RDONLY));
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const char* p = dir.path().c_str();
+  // Unknown flag, two mark types, no command, two commands.
+  EXPECT_THAT(
+      fanotify_mark(g.get(), FAN_MARK_ADD | 0x80000000, FAN_OPEN, AT_FDCWD, p),
+      SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(fanotify_mark(g.get(),
+                            FAN_MARK_ADD | FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM,
+                            FAN_OPEN, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(fanotify_mark(g.get(), 0, FAN_OPEN, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD | FAN_MARK_REMOVE, FAN_OPEN,
+                            AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  // Empty mask for ADD and REMOVE.
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, 0, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, 0, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  // FLUSH accepts only the mark-type bits.
+  for (unsigned extra : {FAN_MARK_ONLYDIR, FAN_MARK_DONT_FOLLOW,
+                         FAN_MARK_IGNORED_MASK}) {
+    EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | extra, 0, AT_FDCWD,
+                              nullptr),
+                SyscallFailsWithErrno(EINVAL))
+        << extra;
+  }
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | FAN_MARK_MOUNT, 0,
+                            AT_FDCWD, nullptr),
+              SyscallSucceeds());
+  // Mask validation comes before the fd lookup.
+  EXPECT_THAT(fanotify_mark(-1, FAN_MARK_ADD, 0, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(fanotify_mark(-1, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p),
+              SyscallFailsWithErrno(EBADF));
+  // Not a fanotify fd.
+  FileDescriptor other = ASSERT_NO_ERRNO_AND_VALUE(Open(p, O_RDONLY));
+  EXPECT_THAT(fanotify_mark(other.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  // Permission events need a content class.
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  // FID-only events on a group without FID reporting.
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, FAN_CREATE, AT_FDCWD, p),
+              SyscallFailsWithErrno(EINVAL));
+  // ONLYDIR on a file.
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD | FAN_MARK_ONLYDIR, FAN_OPEN,
+                            AT_FDCWD, file.path().c_str()),
+              SyscallFailsWithErrno(ENOTDIR));
+  // REMOVE without a mark.
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p),
+              SyscallFailsWithErrno(ENOENT));
+  // ADD, then REMOVE. Removing bits that are not set succeeds while the mark
+  // exists; the mark goes away with its last bit.
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN | FAN_ACCESS, AT_FDCWD, p));
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p),
+              SyscallSucceeds());
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p),
+              SyscallSucceeds());
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_ACCESS, AT_FDCWD, p),
+              SyscallSucceeds());
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_ACCESS, AT_FDCWD, p),
+              SyscallFailsWithErrno(ENOENT));
+}
+
+TEST(FanotifyTest, OpenPermRejectedOnGvisor) {
+  // gVisor does not support FAN_OPEN_PERM and FAN_OPEN_EXEC_PERM yet.
+  SKIP_IF(!IsRunningOnGvisor());
+  SkipIfNoSysAdmin();
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  for (uint64_t m : {static_cast<uint64_t>(FAN_OPEN_PERM),
+                     static_cast<uint64_t>(FAN_OPEN_EXEC_PERM)}) {
+    EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, m, AT_FDCWD,
+                              dir.path().c_str()),
+                SyscallFailsWithErrno(EINVAL));
+  }
+}
+
+TEST(FanotifyTest, MountMarkNeedsCurrentSysAdmin) {
+  SkipIfNoSysAdmin();
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_NOTIF, O_RDONLY));
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const char* p = dir.path().c_str();
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN, AT_FDCWD, p));
+  AutoCapability cap(CAP_SYS_ADMIN, false);
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                            FAN_OPEN, AT_FDCWD, p),
+              SyscallFailsWithErrno(EPERM));
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE | FAN_MARK_MOUNT,
+                            FAN_OPEN, AT_FDCWD, p),
+              SyscallFailsWithErrno(EPERM));
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | FAN_MARK_MOUNT, 0,
+                            AT_FDCWD, nullptr),
+              SyscallFailsWithErrno(EPERM));
+  // Inode marks do not need CAP_SYS_ADMIN.
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p),
+              SyscallSucceeds());
+}
+
+TEST(FanotifyTest, InternalObjectsAndProc) {
+  SkipIfNoSysAdmin();
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  int mfd = memfd_create("fan", 0);
+  ASSERT_THAT(mfd, SyscallSucceeds());
+  FileDescriptor memfd(mfd);
+  // Inode mark on a memfd by fd: allowed. Mount mark: rejected.
+  EXPECT_THAT(
+      fanotify_mark(g.get(), FAN_MARK_ADD, FAN_MODIFY, memfd.get(), nullptr),
+      SyscallSucceeds());
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_MODIFY,
+                            memfd.get(), nullptr),
+              SyscallFailsWithErrno(EINVAL));
+  // Permission marks on procfs are rejected on ADD. Removing a permission
+  // bit from a notification mark on procfs succeeds.
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD,
+                            "/proc/self/status"),
+              SyscallFailsWithErrno(EINVAL));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS, AT_FDCWD,
+                          "/proc/self/status"));
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_ACCESS_PERM,
+                            AT_FDCWD, "/proc/self/status"),
+              SyscallSucceeds());
+}
+
+TEST(FanotifyTest, MarksDoNotKeepMountBusy) {
+  SkipIfNoSysAdmin();
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), "tmpfs", 0, "", 0));
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_NOTIF, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN,
+                          AT_FDCWD, dir.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN, AT_FDCWD, dir.path().c_str()));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, dir.path().c_str()));
+  // A normal umount succeeds while the marks exist.
+  ASSERT_THAT(umount(dir.path().c_str()), SyscallSucceeds());
+  mount.Release();  // Already unmounted.
+  // The group still works after its objects went away.
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | FAN_MARK_MOUNT, 0,
+                            AT_FDCWD, nullptr),
+              SyscallSucceeds());
 }
 
 }  // namespace

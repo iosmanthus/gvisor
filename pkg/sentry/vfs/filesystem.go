@@ -46,6 +46,12 @@ type Filesystem struct {
 	// impl is the FilesystemImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in Dentry.
 	impl FilesystemImpl
+
+	// fanotify holds the fanotify filesystem marks on this filesystem.
+	fanotify fanotifyMarks
+
+	// fanotifyFlags is a set of FanotifyNoUser and FanotifyNoPermEvents.
+	fanotifyFlags uint32
 }
 
 // Init must be called before first use of fs.
@@ -80,6 +86,8 @@ func (fs *Filesystem) DecRef(ctx context.Context) {
 		fs.vfs.filesystemsMu.Lock()
 		delete(fs.vfs.filesystems, fs)
 		fs.vfs.filesystemsMu.Unlock()
+		// Filesystem marks go away with the filesystem.
+		fs.fanotify.detachAll()
 		fs.impl.Release(ctx)
 	})
 }
@@ -607,4 +615,15 @@ type HostFDProvider interface {
 type MountRootPathProvider interface {
 	// MountRootPath returns the root path of the mount rooted at vd in mountinfo.
 	MountRootPath(ctx context.Context, vd VirtualDentry) string
+}
+
+// SetFanotifyFlags sets the fanotify flags of fs (FanotifyNoUser,
+// FanotifyNoPermEvents). Call it before applications can reach fs.
+func (fs *Filesystem) SetFanotifyFlags(f uint32) {
+	fs.fanotifyFlags = f
+}
+
+// FanotifyFlags returns the fanotify flags of fs.
+func (fs *Filesystem) FanotifyFlags() uint32 {
+	return fs.fanotifyFlags
 }

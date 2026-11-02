@@ -54,6 +54,16 @@ type Group struct {
 	// queue wakes readers and epoll. It is saved: epoll registrations live
 	// here.
 	queue waiter.Queue
+
+	// markMu protects marks. It is the outermost fanotify lock: it can be
+	// held while vfs mark containers and filesystem locks are taken.
+	markMu groupMarkMutex `state:"nosave"`
+
+	// marks are the marks of this group. vfs can detach a mark when its
+	// object goes away; such marks stay here until the group next prunes.
+	//
+	// +checklocks:markMu
+	marks []*vfs.FanotifyMark
 }
 
 var _ vfs.FileDescriptionImpl = (*Group)(nil)
@@ -111,11 +121,14 @@ func (g *Group) HandleEvent(ctx context.Context, ev *vfs.FanotifyEventInfo) erro
 	return nil
 }
 
-// MarkDetached implements vfs.FanotifyGroup.MarkDetached.
-func (g *Group) MarkDetached(ctx context.Context, m *vfs.FanotifyMark) {}
-
 // Release implements vfs.FileDescriptionImpl.Release.
 func (g *Group) Release(ctx context.Context) {
+	g.markMu.Lock()
+	for _, m := range g.marks {
+		m.Detach(ctx)
+	}
+	g.marks = nil
+	g.markMu.Unlock()
 	g.vfsObj.FanotifyGroupsAdd(-1)
 }
 

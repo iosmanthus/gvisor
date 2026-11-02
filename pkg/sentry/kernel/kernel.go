@@ -706,6 +706,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	}
 	defer tmpfsFilesystem.DecRef(ctx)
 	defer tmpfsRoot.DecRef(ctx)
+	// The memfd mount is kernel-internal (Linux shm_mnt is SB_NOUSER).
+	tmpfsFilesystem.SetFanotifyFlags(vfs.FanotifyNoUser)
 	k.shmMount = k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{})
 
 	socketFilesystem, err := sockfs.NewFilesystem(&k.vfs)

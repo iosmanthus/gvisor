@@ -151,6 +151,9 @@ type Mount struct {
 	// Mount.EndWrite(). The MSB of writers is set if MS_RDONLY is in effect.
 	// writers is accessed using atomic memory operations.
 	writers atomicbitops.Int64
+
+	// fanotify holds the fanotify mount marks on this mount.
+	fanotify fanotifyMarks
 }
 
 func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *MountNamespace, opts *MountOptions) *Mount {
@@ -1328,6 +1331,8 @@ func (mnt *Mount) DecRef(ctx context.Context) {
 func (mnt *Mount) destroy(ctx context.Context) {
 	mnt.vfs.lockMounts()
 	defer mnt.vfs.unlockMounts(ctx)
+	// Mount marks go away with the mount. This does not call into groups.
+	mnt.fanotify.detachAll()
 	if mnt.parent() != nil {
 		mnt.vfs.mounts.seq.BeginWrite()
 		vd := mnt.vfs.disconnectLocked(mnt)

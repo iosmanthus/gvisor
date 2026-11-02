@@ -408,13 +408,19 @@ type Watches struct {
 	//
 	// +checklocks:mu
 	ws map[uint64]*Watch
+
+	// fanotify holds the fanotify inode marks on this inode.
+	fanotify fanotifyMarks
 }
 
 // Size returns the number of watches held by w.
 func (w *Watches) Size() int {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	return len(w.ws)
+	n := len(w.ws)
+	w.mu.Unlock()
+	// Filesystems use Size to keep watched dentries cached. Fanotify inode
+	// marks need the same.
+	return n + w.fanotify.size()
 }
 
 // Lookup returns the watch owned by an inotify instance with the given id.
@@ -517,6 +523,10 @@ func (w *Watches) cleanupExpiredWatches(ctx context.Context) {
 // generate the appropriate events.
 func (w *Watches) HandleDeletion(ctx context.Context) {
 	w.Notify(ctx, "", linux.IN_DELETE_SELF, 0, InodeEvent, true /* unlinked */)
+
+	// Fanotify inode marks go away with the inode (Linux
+	// fsnotify_inode_delete()). This does not call into groups.
+	w.fanotify.detachAll()
 
 	// As in Watches.Notify, we can't hold w.mu while acquiring Inotify.mu for
 	// the owner of each watch being deleted. Instead, atomically store the

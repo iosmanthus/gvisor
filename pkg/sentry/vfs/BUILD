@@ -1,4 +1,4 @@
-load("//pkg/sync/locking:locking.bzl", "declare_mutex")
+load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
@@ -11,6 +11,13 @@ declare_mutex(
     out = "virtual_filesystem_mutex.go",
     package = "vfs",
     prefix = "virtualFilesystem",
+)
+
+declare_rwmutex(
+    name = "fanotify_marks_mutex",
+    out = "fanotify_marks_mutex.go",
+    package = "vfs",
+    prefix = "fanotifyMarks",
 )
 
 declare_mutex(
@@ -142,6 +149,7 @@ go_library(
         "epoll_mutex.go",
         "event_list.go",
         "fanotify.go",
+        "fanotify_marks_mutex.go",
         "file_description.go",
         "file_description_impl_util.go",
         "file_description_refs.go",
