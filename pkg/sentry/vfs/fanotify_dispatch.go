@@ -15,8 +15,6 @@
 package vfs
 
 import (
-	"sort"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -131,22 +129,17 @@ func (vfs *VirtualFilesystem) fanotifyPathEvent(ctx context.Context, vd VirtualD
 		snaps = ws.fanotify.snapInto(snaps, fanRoleInode, event)
 	}
 	if pp, ok := vd.dentry.impl.(FanotifyParentProvider); ok && vfs.fanotifyInodeMarks.Load() != 0 {
-		pp.WithParentWatches(func(parent *Watches) {
+		if parent := pp.LockParentWatches(); parent != nil {
 			snaps = parent.fanotify.snapInto(snaps, fanRoleParent, event)
-		})
+		}
+		pp.UnlockParentWatches()
 	}
 	if len(snaps) == 0 {
 		return nil
 	}
 	// Deliver in priority order: pre-content, content, notification groups
 	// (Linux fsnotify_compare_groups()), and each group once.
-	sort.SliceStable(snaps, func(i, j int) bool {
-		pi, pj := snaps[i].group.Priority(), snaps[j].group.Priority()
-		if pi != pj {
-			return pi > pj
-		}
-		return snaps[i].group.ID() < snaps[j].group.ID()
-	})
+	fanotifySortSnaps(snaps)
 	for i := 0; i < len(snaps); {
 		j := i + 1
 		for j < len(snaps) && snaps[j].group == snaps[i].group {
@@ -161,6 +154,24 @@ func (vfs *VirtualFilesystem) fanotifyPathEvent(ctx context.Context, vd VirtualD
 		i = j
 	}
 	return nil
+}
+
+// fanotifySortSnaps sorts snaps by group priority (highest first), then by
+// group ID. It is an insertion sort: snapshots are short, and it does not make
+// the stack array of the caller escape to the heap as sort.Slice would.
+func fanotifySortSnaps(snaps []fanotifySnap) {
+	less := func(a, b *fanotifySnap) bool {
+		pa, pb := a.group.Priority(), b.group.Priority()
+		if pa != pb {
+			return pa > pb
+		}
+		return a.group.ID() < b.group.ID()
+	}
+	for i := 1; i < len(snaps); i++ {
+		for j := i; j > 0 && less(&snaps[j], &snaps[j-1]); j-- {
+			snaps[j], snaps[j-1] = snaps[j-1], snaps[j]
+		}
+	}
 }
 
 // fanotifyInodeModify handles a modification that has no path (truncate,
@@ -179,10 +190,14 @@ func fanotifyInodeModify(d *Dentry, fs *Filesystem) {
 // FanotifyParentProvider is implemented by DentryImpls that support
 // FAN_EVENT_ON_CHILD.
 type FanotifyParentProvider interface {
-	// WithParentWatches calls fn with the Watches of the parent, if there is
-	// one, while it holds the filesystem's ancestry lock for reading. fn
-	// must not block and must not take group locks.
-	WithParentWatches(fn func(parent *Watches))
+	// LockParentWatches takes the filesystem's ancestry lock for reading and
+	// returns the Watches of the parent, or nil if there is no parent. The
+	// caller must not block, must not take group locks, and must call
+	// UnlockParentWatches.
+	LockParentWatches() *Watches
+
+	// UnlockParentWatches releases the lock that LockParentWatches took.
+	UnlockParentWatches()
 }
 
 // CheckAccessPerm sends FAN_ACCESS_PERM for a read from fd (Linux

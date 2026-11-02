@@ -761,13 +761,17 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
-// WithParentWatches implements vfs.FanotifyParentProvider.WithParentWatches.
+// LockParentWatches implements vfs.FanotifyParentProvider.LockParentWatches.
 // The parent of an erofs dentry does not change, so no lock is needed.
-func (d *dentry) WithParentWatches(fn func(parent *vfs.Watches)) {
+func (d *dentry) LockParentWatches() *vfs.Watches {
 	if parent := d.parent.Load(); parent != nil {
-		fn(&parent.inode.watches)
+		return &parent.inode.watches
 	}
+	return nil
 }
+
+// UnlockParentWatches implements vfs.FanotifyParentProvider.UnlockParentWatches.
+func (d *dentry) UnlockParentWatches() {}
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 func (d *dentry) OnZeroWatches(ctx context.Context) {

@@ -857,13 +857,18 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.watches
 }
 
-// WithParentWatches implements vfs.FanotifyParentProvider.WithParentWatches.
-func (d *dentry) WithParentWatches(fn func(parent *vfs.Watches)) {
+// LockParentWatches implements vfs.FanotifyParentProvider.LockParentWatches.
+func (d *dentry) LockParentWatches() *vfs.Watches {
 	d.fs.ancestryMu.RLock()
-	defer d.fs.ancestryMu.RUnlock()
 	if parent := d.parent.Load(); parent != nil {
-		fn(&parent.watches)
+		return &parent.watches
 	}
+	return nil
+}
+
+// UnlockParentWatches implements vfs.FanotifyParentProvider.UnlockParentWatches.
+func (d *dentry) UnlockParentWatches() {
+	d.fs.ancestryMu.RUnlock()
 }
 
 // contextID is this package's type for context.Context.Value keys.

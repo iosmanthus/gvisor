@@ -629,13 +629,18 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
-// WithParentWatches implements vfs.FanotifyParentProvider.WithParentWatches.
-func (d *dentry) WithParentWatches(fn func(parent *vfs.Watches)) {
+// LockParentWatches implements vfs.FanotifyParentProvider.LockParentWatches.
+func (d *dentry) LockParentWatches() *vfs.Watches {
 	d.inode.fs.ancestryMu.RLock()
-	defer d.inode.fs.ancestryMu.RUnlock()
 	if parent := d.parent.Load(); parent != nil {
-		fn(&parent.inode.watches)
+		return &parent.inode.watches
 	}
+	return nil
+}
+
+// UnlockParentWatches implements vfs.FanotifyParentProvider.UnlockParentWatches.
+func (d *dentry) UnlockParentWatches() {
+	d.inode.fs.ancestryMu.RUnlock()
 }
 
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.

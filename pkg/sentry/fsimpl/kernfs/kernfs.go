@@ -616,18 +616,23 @@ func (d *Dentry) Watches() *vfs.Watches {
 	return d.inode.Watches()
 }
 
-// WithParentWatches implements vfs.FanotifyParentProvider.WithParentWatches.
-func (d *Dentry) WithParentWatches(fn func(parent *vfs.Watches)) {
+// LockParentWatches implements vfs.FanotifyParentProvider.LockParentWatches.
+func (d *Dentry) LockParentWatches() *vfs.Watches {
 	// Anonymous inodes have no parent, as in InotifyWithParent.
 	if d.inode.Anonymous() {
-		return
+		return nil
 	}
 	d.fs.ancestryMu.RLock()
-	defer d.fs.ancestryMu.RUnlock()
 	if parent := d.parent.Load(); parent != nil {
-		if ws := parent.inode.Watches(); ws != nil {
-			fn(ws)
-		}
+		return parent.inode.Watches()
+	}
+	return nil
+}
+
+// UnlockParentWatches implements vfs.FanotifyParentProvider.UnlockParentWatches.
+func (d *Dentry) UnlockParentWatches() {
+	if !d.inode.Anonymous() {
+		d.fs.ancestryMu.RUnlock()
 	}
 }
 
