@@ -616,6 +616,21 @@ func (d *Dentry) Watches() *vfs.Watches {
 	return d.inode.Watches()
 }
 
+// WithParentWatches implements vfs.FanotifyParentProvider.WithParentWatches.
+func (d *Dentry) WithParentWatches(fn func(parent *vfs.Watches)) {
+	// Anonymous inodes have no parent, as in InotifyWithParent.
+	if d.inode.Anonymous() {
+		return
+	}
+	d.fs.ancestryMu.RLock()
+	defer d.fs.ancestryMu.RUnlock()
+	if parent := d.parent.Load(); parent != nil {
+		if ws := parent.inode.Watches(); ws != nil {
+			fn(ws)
+		}
+	}
+}
+
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
 func (d *Dentry) OnZeroWatches(context.Context) {}
 

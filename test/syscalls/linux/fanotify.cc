@@ -20,6 +20,7 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -617,6 +618,138 @@ TEST(FanotifyTest, TwoReadersGetEachEventOnce) {
   t1.Join();
   t2.Join();
   EXPECT_EQ(total.load(), kFiles);
+}
+
+TEST(FanotifyTest, OnDirAndChild) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string d = JoinPath(top.path(), "d");
+  std::string f = JoinPath(d, "f");
+  ASSERT_THAT(mkdir(d.c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_ERRNO(CreateWithContents(f, "x"));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  // A directory mark without FAN_ONDIR and FAN_EVENT_ON_CHILD sees nothing.
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, d.c_str()));
+  EXPECT_TRUE(EventsAfter(g.get(), [&] {
+                Open(d, O_RDONLY | O_DIRECTORY).IgnoreError();
+                Open(f, O_RDONLY).IgnoreError();
+              }).empty());
+  // With FAN_ONDIR the directory open is reported, without the FAN_ONDIR
+  // bit.
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN | FAN_ONDIR, AT_FDCWD, d.c_str()));
+  auto evs = EventsAfter(
+      g.get(), [&] { Open(d, O_RDONLY | O_DIRECTORY).IgnoreError(); });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].mask, FAN_OPEN);
+  // With FAN_EVENT_ON_CHILD the open of the child is reported.
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN | FAN_EVENT_ON_CHILD,
+                          AT_FDCWD, d.c_str()));
+  evs = EventsAfter(g.get(), [&] { Open(f, O_RDONLY).IgnoreError(); });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].path, f);
+  EXPECT_EQ(evs[0].mask, FAN_OPEN);
+}
+
+TEST(FanotifyTest, OnDirIsPerMark) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT,
+                          FAN_OPEN | FAN_ONDIR, AT_FDCWD, top.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_ACCESS, AT_FDCWD, top.path().c_str()));
+  auto evs = EventsAfter(g.get(), [&] {
+    FileDescriptor dfd = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(top.path(), O_RDONLY | O_DIRECTORY));
+    char buf[256];
+    // getdents gives FAN_ACCESS on a directory.
+    ASSERT_THAT(syscall(SYS_getdents64, dfd.get(), buf, sizeof(buf)),
+                SyscallSucceeds());
+  });
+  uint64_t all = 0;
+  for (auto& e : evs) {
+    all |= e.mask;
+  }
+  // No FAN_ACCESS: the mark that wants it has no FAN_ONDIR.
+  EXPECT_EQ(all, FAN_OPEN);
+}
+
+TEST(FanotifyTest, IgnoreMasks) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string a = JoinPath(top.path(), "a");
+  std::string b = JoinPath(top.path(), "b");
+  ASSERT_NO_ERRNO(CreateWithContents(a, "x"));
+  ASSERT_NO_ERRNO(CreateWithContents(b, "x"));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_ACCESS | FAN_MODIFY, AT_FDCWD,
+                          top.path().c_str()));
+  // An ignore-only inode mark on a suppresses the filesystem mark for a.
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_IGNORED_MASK,
+                          FAN_ACCESS, AT_FDCWD, a.c_str()));
+  auto read1 = [](const std::string& p) {
+    char c;
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(p, O_RDONLY));
+    ASSERT_THAT(read(fd.get(), &c, 1), SyscallSucceeds());
+  };
+  auto write1 = [](const std::string& p) {
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(p, O_WRONLY));
+    ASSERT_THAT(write(fd.get(), "y", 1), SyscallSucceeds());
+  };
+  auto evs = EventsAfter(g.get(), [&] {
+    read1(a);
+    read1(b);
+  });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].path, b);
+  // A modification of a clears the ignore mask; the modification itself is
+  // reported.
+  evs = EventsAfter(g.get(), [&] { write1(a); });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].mask, FAN_MODIFY);
+  evs = EventsAfter(g.get(), [&] { read1(a); });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].mask, FAN_ACCESS);
+  // With FAN_MARK_IGNORED_SURV_MODIFY the ignore mask stays.
+  ASSERT_NO_ERRNO(FanMark(
+      g.get(),
+      FAN_MARK_ADD | FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORED_SURV_MODIFY,
+      FAN_ACCESS, AT_FDCWD, a.c_str()));
+  EventsAfter(g.get(), [&] { write1(a); });
+  EXPECT_TRUE(EventsAfter(g.get(), [&] { read1(a); }).empty());
+}
+
+TEST(FanotifyTest, IgnoreClearedByUnsubscribedModify) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "x", 0644));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS, AT_FDCWD, f.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_IGNORED_MASK,
+                          FAN_ACCESS, AT_FDCWD, f.path().c_str()));
+  {
+    // The mark does not subscribe to FAN_MODIFY; the write still clears the
+    // ignore mask (Linux fsnotify_calc_mask()).
+    FileDescriptor w = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_WRONLY));
+    ASSERT_THAT(write(w.get(), "y", 1), SyscallSucceeds());
+  }
+  auto evs = EventsAfter(g.get(), [&] {
+    char c;
+    FileDescriptor r = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    ASSERT_THAT(read(r.get(), &c, 1), SyscallSucceeds());
+  });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].mask, FAN_ACCESS);
 }
 
 }  // namespace
