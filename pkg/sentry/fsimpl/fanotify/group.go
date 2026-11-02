@@ -82,6 +82,12 @@ type Group struct {
 	// +checklocks:queueMu
 	overflowQueued bool
 
+	// merge maps the key of each queued notification event to the newest
+	// such event. It is rebuilt on restore.
+	//
+	// +checklocks:queueMu
+	merge map[mergeKey]*event `state:"nosave"`
+
 	// shutdown is set when the group is released. No event is queued after.
 	//
 	// +checklocks:queueMu
@@ -101,6 +107,7 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, flags, eventFFlags 
 	defer vd.DecRef(ctx)
 	g := &Group{
 		vfsObj: vfsObj,
+		merge:  make(map[mergeKey]*event),
 		id:     uniqueid.GlobalFromContext(ctx),
 		flags:  flags,
 		// Linux adds O_LARGEFILE on 64-bit (force_o_largefile()).
@@ -157,6 +164,8 @@ func (g *Group) Release(ctx context.Context) {
 		}
 	}
 	g.qlen = 0
+	clear(g.merge)
+	g.overflowQueued = false
 	g.queueMu.Unlock()
 	// Drop references without queueMu: a drop can run filesystem teardown.
 	for _, vd := range drop {

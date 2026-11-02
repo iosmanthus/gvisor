@@ -14,13 +14,17 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/fanotify.h>
+#include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -36,6 +40,7 @@
 #include "absl/strings/str_cat.h"
 #include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
+#include "test/util/epoll_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/mount_util.h"
@@ -750,6 +755,149 @@ TEST(FanotifyTest, IgnoreClearedByUnsubscribedModify) {
   });
   ASSERT_EQ(evs.size(), 1);
   EXPECT_EQ(evs[0].mask, FAN_ACCESS);
+}
+
+TEST(FanotifyTest, MergeAndThreads) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string a = JoinPath(top.path(), "a");
+  std::string b = JoinPath(top.path(), "b");
+  ASSERT_NO_ERRNO(CreateWithContents(a, "xxxx"));
+  ASSERT_NO_ERRNO(CreateWithContents(b, "xxxx"));
+  for (bool tid : {false, true}) {
+    SCOPED_TRACE(tid ? "FAN_REPORT_TID" : "TGID");
+    FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(FanInit(
+        FAN_CLASS_NOTIF | FAN_NONBLOCK | (tid ? FAN_REPORT_TID : 0), O_RDONLY));
+    ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                            FAN_ACCESS, AT_FDCWD, top.path().c_str()));
+    FileDescriptor fa = ASSERT_NO_ERRNO_AND_VALUE(Open(a, O_RDONLY));
+    FileDescriptor fb = ASSERT_NO_ERRNO_AND_VALUE(Open(b, O_RDONLY));
+    char c;
+    // a, b, a: the second access of a merges into the first, also with b
+    // between them.
+    ASSERT_THAT(pread(fa.get(), &c, 1, 0), SyscallSucceeds());
+    ASSERT_THAT(pread(fb.get(), &c, 1, 0), SyscallSucceeds());
+    ASSERT_THAT(pread(fa.get(), &c, 1, 1), SyscallSucceeds());
+    // Another thread of this process reads b.
+    ScopedThread([&] {
+      char d;
+      ASSERT_THAT(pread(fb.get(), &d, 1, 2), SyscallSucceeds());
+    }).Join();
+    int n = 0;
+    ASSERT_THAT(ioctl(g.get(), FIONREAD, &n), SyscallSucceeds());
+    auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 1000));
+    EXPECT_EQ(n, static_cast<int>(evs.size() * sizeof(fanotify_event_metadata)));
+    // Without FAN_REPORT_TID the thread's access of b merges with the main
+    // thread's (same TGID); with it, it is a separate event.
+    EXPECT_EQ(evs.size(), tid ? 3u : 2u);
+    if (!tid) {
+      for (auto& e : evs) {
+        EXPECT_EQ(e.pid, getpid());
+      }
+    }
+  }
+}
+
+TEST(FanotifyTest, PidOfExitedProcessAndOtherNamespace) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "x", 0644));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f.path().c_str()));
+  pid_t child = fork();
+  if (child == 0) {
+    int fd = open(f.path().c_str(), O_RDONLY);
+    _exit(fd >= 0 ? 0 : 1);
+  }
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  // The child is reaped; the event still has its PID.
+  auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 1000));
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].pid, child);
+  // A reader in a child PID namespace cannot see an origin outside it.
+  Open(f.path(), O_RDONLY).IgnoreError();
+  pid_t outer = fork();
+  if (outer == 0) {
+    TEST_PCHECK(unshare(CLONE_NEWPID) == 0);
+    pid_t inner = fork();  // PID 1 of the new namespace.
+    if (inner == 0) {
+      char buf[256] __attribute__((aligned(8)));
+      ssize_t len = read(g.get(), buf, sizeof(buf));
+      TEST_PCHECK(len >= static_cast<ssize_t>(sizeof(fanotify_event_metadata)));
+      auto* md = reinterpret_cast<fanotify_event_metadata*>(buf);
+      _exit(md->pid == 0 ? 0 : 1);
+    }
+    int st;
+    TEST_PCHECK(waitpid(inner, &st, 0) == inner);
+    _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 2);
+  }
+  ASSERT_THAT(RetryEINTR(waitpid)(outer, &status, 0),
+              SyscallSucceedsWithValue(outer));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+}
+
+TEST(FanotifyTest, OverflowOnce) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN, AT_FDCWD, top.path().c_str()));
+  // More events than the default queue holds, none of them mergeable.
+  constexpr int kQueue = 16384;
+  for (int i = 0; i < kQueue + 100; i++) {
+    int fd = open(JoinPath(top.path(), absl::StrCat("f", i)).c_str(),
+                  O_CREAT | O_RDONLY, 0644);
+    ASSERT_THAT(fd, SyscallSucceeds());
+    close(fd);
+  }
+  int overflows = 0;
+  int events = 0;
+  char buf[4096] __attribute__((aligned(8)));
+  ssize_t len;
+  while ((len = read(g.get(), buf, sizeof(buf))) > 0) {
+    for (auto* md = reinterpret_cast<fanotify_event_metadata*>(buf);
+         FAN_EVENT_OK(md, len); md = FAN_EVENT_NEXT(md, len)) {
+      if (md->mask & FAN_Q_OVERFLOW) {
+        overflows++;
+        EXPECT_EQ(md->fd, FAN_NOFD);
+      } else {
+        events++;
+        close(md->fd);
+      }
+    }
+  }
+  EXPECT_EQ(overflows, 1);
+  EXPECT_EQ(events, kQueue);
+}
+
+TEST(FanotifyTest, PollAndEpoll) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "x", 0644));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f.path().c_str()));
+  FileDescriptor ep = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+  ASSERT_NO_ERRNO(
+      RegisterEpollFD(ep.get(), g.get(), EPOLLIN | EPOLLRDNORM | EPOLLOUT, 0));
+  struct pollfd p = {.fd = g.get(), .events = POLLIN | POLLRDNORM | POLLOUT};
+  // Never writable, not readable while empty.
+  EXPECT_THAT(poll(&p, 1, 0), SyscallSucceedsWithValue(0));
+  Open(f.path(), O_RDONLY).IgnoreError();
+  EXPECT_THAT(poll(&p, 1, 1000), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(p.revents, POLLIN | POLLRDNORM);
+  struct epoll_event ev;
+  EXPECT_THAT(RetryEINTR(epoll_wait)(ep.get(), &ev, 1, 1000),
+              SyscallSucceedsWithValue(1));
+  EXPECT_EQ(ev.events, EPOLLIN | EPOLLRDNORM);
 }
 
 }  // namespace

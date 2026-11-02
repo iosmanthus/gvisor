@@ -218,20 +218,6 @@ func (g *Group) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // Stubs completed by later changes.
 
-// +checklocks:g.queueMu
-func (g *Group) tryMergeLocked(ev *event, vd vfs.VirtualDentry) bool {
-	return false
-}
-
-// +checklocks:g.queueMu
-func (g *Group) rememberLocked(ev *event) {}
-
-// +checklocks:g.queueMu
-func (g *Group) forgetLocked(ev *event) {}
-
-// +checklocks:g.queueMu
-func (g *Group) addOverflowLocked() {}
-
 // Permission event states.
 const (
 	permQueued = iota
