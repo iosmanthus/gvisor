@@ -173,6 +173,13 @@ type VirtualFilesystem struct {
 	// The low 32 bits store the number of currently in-progress renames
 	// VFS-wide.
 	renameState atomicbitops.Uint64
+
+	// fanotifyGroups is the number of live fanotify groups.
+	fanotifyGroups atomicbitops.Int64
+
+	// fanotifyMarks is the number of fanotify marks on all objects. When it
+	// is zero, file events do no fanotify work.
+	fanotifyMarks atomicbitops.Int64
 }
 
 const renameInProgressMask = 1<<32 - 1
