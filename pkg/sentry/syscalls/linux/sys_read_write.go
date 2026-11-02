@@ -226,7 +226,7 @@ func Preadv2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	}
 
 	opts := vfs.ReadOptions{
-		Flags: uint32(flags),
+		Flags:  uint32(flags),
 		Vector: true,
 	}
 	var n int64

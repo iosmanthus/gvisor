@@ -217,4 +217,3 @@ func (g *Group) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // Stubs completed by later changes.
-

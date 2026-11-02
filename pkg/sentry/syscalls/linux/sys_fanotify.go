@@ -58,7 +58,6 @@ func FanotifyInit(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 	return uintptr(fd), nil, nil
 }
 
-
 // fanMarkFlags are the fanotify_mark(2) flags that gVisor supports.
 const fanMarkFlags = linux.FAN_MARK_ADD | linux.FAN_MARK_REMOVE | linux.FAN_MARK_DONT_FOLLOW |
 	linux.FAN_MARK_ONLYDIR | linux.FAN_MARK_MOUNT | linux.FAN_MARK_IGNORED_MASK |

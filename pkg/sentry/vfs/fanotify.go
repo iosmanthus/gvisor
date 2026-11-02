@@ -39,7 +39,6 @@ type FanotifyGroup interface {
 	//
 	// Preconditions: The caller holds no vfs, filesystem, or mark lock.
 	HandleEvent(ctx context.Context, ev *FanotifyEventInfo) error
-
 }
 
 // FanotifyEventInfo describes one event for one group.
@@ -52,7 +51,6 @@ type FanotifyEventInfo struct {
 	// and FAN_EVENT_ON_CHILD.
 	Mask uint64
 }
-
 
 // MaxFanotifyGroups is the number of fanotify groups in one sandbox. Linux
 // limits groups for each user (fs.fanotify.max_user_groups, default 128).

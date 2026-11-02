@@ -15,8 +15,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
-#include <sys/fanotify.h>
+#include <signal.h>
 #include <sys/epoll.h>
+#include <sys/fanotify.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -28,11 +29,13 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <unistd.h>
 
 // After sys/mount.h: linux/aio_abi.h includes linux/fs.h.
 #include <linux/aio_abi.h>
+#include <linux/capability.h>
+#include <linux/fanotify.h>
+#include <linux/mount.h>
 
 #include <atomic>
 #include <cerrno>
@@ -44,14 +47,16 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "absl/strings/str_cat.h"
 #include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
 #include "test/util/epoll_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
 #include "test/util/mount_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
@@ -167,8 +172,7 @@ TEST(FanotifyTest, InitOutOfScopeFlagsRejectedOnGvisor) {
         static_cast<unsigned>(FAN_REPORT_DIR_FID | FAN_REPORT_NAME),
         static_cast<unsigned>(FAN_REPORT_PIDFD),
         static_cast<unsigned>(FAN_ENABLE_AUDIT)}) {
-    EXPECT_THAT(fanotify_init(f, O_RDONLY), SyscallFailsWithErrno(EINVAL))
-        << f;
+    EXPECT_THAT(fanotify_init(f, O_RDONLY), SyscallFailsWithErrno(EINVAL)) << f;
   }
 }
 
@@ -239,11 +243,11 @@ TEST(FanotifyTest, MarkValidation) {
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, 0, AT_FDCWD, p),
               SyscallFailsWithErrno(EINVAL));
   // FLUSH accepts only the mark-type bits.
-  for (unsigned extra : {FAN_MARK_ONLYDIR, FAN_MARK_DONT_FOLLOW,
-                         FAN_MARK_IGNORED_MASK}) {
-    EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | extra, 0, AT_FDCWD,
-                              nullptr),
-                SyscallFailsWithErrno(EINVAL))
+  for (unsigned extra :
+       {FAN_MARK_ONLYDIR, FAN_MARK_DONT_FOLLOW, FAN_MARK_IGNORED_MASK}) {
+    EXPECT_THAT(
+        fanotify_mark(g.get(), FAN_MARK_FLUSH | extra, 0, AT_FDCWD, nullptr),
+        SyscallFailsWithErrno(EINVAL))
         << extra;
   }
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | FAN_MARK_MOUNT, 0,
@@ -259,8 +263,9 @@ TEST(FanotifyTest, MarkValidation) {
   EXPECT_THAT(fanotify_mark(other.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p),
               SyscallFailsWithErrno(EINVAL));
   // Permission events need a content class.
-  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, p),
-              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(
+      fanotify_mark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD, p),
+      SyscallFailsWithErrno(EINVAL));
   // FID-only events on a group without FID reporting.
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, FAN_CREATE, AT_FDCWD, p),
               SyscallFailsWithErrno(EINVAL));
@@ -295,9 +300,9 @@ TEST(FanotifyTest, OpenPermRejectedOnGvisor) {
   auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   for (uint64_t m : {static_cast<uint64_t>(FAN_OPEN_PERM),
                      static_cast<uint64_t>(FAN_OPEN_EXEC_PERM)}) {
-    EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD, m, AT_FDCWD,
-                              dir.path().c_str()),
-                SyscallFailsWithErrno(EINVAL));
+    EXPECT_THAT(
+        fanotify_mark(g.get(), FAN_MARK_ADD, m, AT_FDCWD, dir.path().c_str()),
+        SyscallFailsWithErrno(EINVAL));
   }
 }
 
@@ -313,8 +318,8 @@ TEST(FanotifyTest, MountMarkNeedsCurrentSysAdmin) {
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
                             FAN_OPEN, AT_FDCWD, p),
               SyscallFailsWithErrno(EPERM));
-  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE | FAN_MARK_MOUNT,
-                            FAN_OPEN, AT_FDCWD, p),
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE | FAN_MARK_MOUNT, FAN_OPEN,
+                            AT_FDCWD, p),
               SyscallFailsWithErrno(EPERM));
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | FAN_MARK_MOUNT, 0,
                             AT_FDCWD, nullptr),
@@ -345,22 +350,22 @@ TEST(FanotifyTest, InternalObjectsAndProc) {
               SyscallFailsWithErrno(EINVAL));
   ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS, AT_FDCWD,
                           "/proc/self/status"));
-  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_ACCESS_PERM,
-                            AT_FDCWD, "/proc/self/status"),
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_ACCESS_PERM, AT_FDCWD,
+                            "/proc/self/status"),
               SyscallSucceeds());
 }
 
 TEST(FanotifyTest, MarksDoNotKeepMountBusy) {
   SkipIfNoSysAdmin();
   auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  auto mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("", dir.path(), "tmpfs", 0, "", 0));
+  auto mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), "tmpfs", 0, "", 0));
   FileDescriptor g =
       ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_NOTIF, O_RDONLY));
   ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN,
                           AT_FDCWD, dir.path().c_str()));
-  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-                          FAN_OPEN, AT_FDCWD, dir.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_OPEN,
+                          AT_FDCWD, dir.path().c_str()));
   ASSERT_NO_ERRNO(
       FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, dir.path().c_str()));
   // A normal umount succeeds while the marks exist.
@@ -461,8 +466,8 @@ TEST(FanotifyTest, FilesystemMarkSeesAllMounts) {
   ASSERT_NO_ERRNO(CreateWithContents(JoinPath(top.path(), "f"), "x"));
   FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
       FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
-  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-                          FAN_OPEN, AT_FDCWD, top.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_OPEN,
+                          AT_FDCWD, top.path().c_str()));
   auto evs = EventsAfter(g.get(), [&] {
     Open(JoinPath(top.path(), "f"), O_RDONLY).IgnoreError();
     Open(JoinPath(bind.path(), "f"), O_RDONLY).IgnoreError();
@@ -480,10 +485,10 @@ TEST(FanotifyTest, EventMasksAndSpecialFiles) {
   ASSERT_THAT(mkfifo(fifo.c_str(), 0644), SyscallSucceeds());
   FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
       FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
-  ASSERT_NO_ERRNO(FanMark(
-      g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-      FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE | FAN_ONDIR, AT_FDCWD,
-      top.path().c_str()));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+              FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE | FAN_ONDIR,
+              AT_FDCWD, top.path().c_str()));
   auto evs = EventsAfter(g.get(), [&] {
     // O_TRUNC and ftruncate give no fanotify event without FID reporting.
     FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f, O_RDWR | O_TRUNC));
@@ -546,14 +551,12 @@ TEST(FanotifyTest, ReadEdgeCases) {
       FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
   char tiny[4];
   // An empty queue gives EAGAIN, also with a small buffer.
-  EXPECT_THAT(read(g.get(), tiny, sizeof(tiny)),
-              SyscallFailsWithErrno(EAGAIN));
+  EXPECT_THAT(read(g.get(), tiny, sizeof(tiny)), SyscallFailsWithErrno(EAGAIN));
   auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   ASSERT_NO_ERRNO(
       FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f.path().c_str()));
   Open(f.path(), O_RDONLY).IgnoreError();
-  EXPECT_THAT(read(g.get(), tiny, sizeof(tiny)),
-              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(read(g.get(), tiny, sizeof(tiny)), SyscallFailsWithErrno(EINVAL));
 }
 
 // LowestFreeFd returns the number that the next new fd gets.
@@ -578,9 +581,9 @@ TEST(FanotifyTest, ReadFaultAndEmfileDoNotLeakFds) {
   Open(f2.path(), O_RDONLY).IgnoreError();
   // The buffer ends at an unmapped page: the first event fits, the second
   // does not.
-  char* mem = static_cast<char*>(mmap(nullptr, 2 * kPageSize,
-                                      PROT_READ | PROT_WRITE,
-                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  char* mem =
+      static_cast<char*>(mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   ASSERT_NE(mem, MAP_FAILED);
   ASSERT_THAT(munmap(mem + kPageSize, kPageSize), SyscallSucceeds());
   int free_before = LowestFreeFd();
@@ -612,13 +615,12 @@ TEST(FanotifyTest, TwoReadersGetEachEventOnce) {
   auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
   FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
       FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
-  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-                          FAN_OPEN, AT_FDCWD, top.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_OPEN,
+                          AT_FDCWD, top.path().c_str()));
   constexpr int kFiles = 200;
   for (int i = 0; i < kFiles; i++) {
-    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
-        Open(JoinPath(top.path(), absl::StrCat("f", i)), O_CREAT | O_RDONLY,
-             0644));
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(
+        JoinPath(top.path(), absl::StrCat("f", i)), O_CREAT | O_RDONLY, 0644));
   }
   std::atomic<int> total(0);
   auto drain = [&] {
@@ -648,15 +650,16 @@ TEST(FanotifyTest, OnDirAndChild) {
   FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
       FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
   // A directory mark without FAN_ONDIR and FAN_EVENT_ON_CHILD sees nothing.
-  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, d.c_str()));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, d.c_str()));
   EXPECT_TRUE(EventsAfter(g.get(), [&] {
                 Open(d, O_RDONLY | O_DIRECTORY).IgnoreError();
                 Open(f, O_RDONLY).IgnoreError();
               }).empty());
   // With FAN_ONDIR the directory open is reported, without the FAN_ONDIR
   // bit.
-  ASSERT_NO_ERRNO(
-      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN | FAN_ONDIR, AT_FDCWD, d.c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN | FAN_ONDIR, AT_FDCWD,
+                          d.c_str()));
   auto evs = EventsAfter(
       g.get(), [&] { Open(d, O_RDONLY | O_DIRECTORY).IgnoreError(); });
   ASSERT_EQ(evs.size(), 1);
@@ -681,8 +684,8 @@ TEST(FanotifyTest, OnDirIsPerMark) {
   ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
                           FAN_ACCESS, AT_FDCWD, top.path().c_str()));
   auto evs = EventsAfter(g.get(), [&] {
-    FileDescriptor dfd = ASSERT_NO_ERRNO_AND_VALUE(
-        Open(top.path(), O_RDONLY | O_DIRECTORY));
+    FileDescriptor dfd =
+        ASSERT_NO_ERRNO_AND_VALUE(Open(top.path(), O_RDONLY | O_DIRECTORY));
     char buf[256];
     // getdents gives FAN_ACCESS on a directory.
     ASSERT_THAT(syscall(SYS_getdents64, dfd.get(), buf, sizeof(buf)),
@@ -800,7 +803,8 @@ TEST(FanotifyTest, MergeAndThreads) {
     int n = 0;
     ASSERT_THAT(ioctl(g.get(), FIONREAD, &n), SyscallSucceeds());
     auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 1000));
-    EXPECT_EQ(n, static_cast<int>(evs.size() * sizeof(fanotify_event_metadata)));
+    EXPECT_EQ(n,
+              static_cast<int>(evs.size() * sizeof(fanotify_event_metadata)));
     // Without FAN_REPORT_TID the thread's access of b merges with the main
     // thread's (same TGID); with it, it is a separate event.
     EXPECT_EQ(evs.size(), tid ? 3u : 2u);
@@ -861,8 +865,8 @@ TEST(FanotifyTest, OverflowOnce) {
   auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
   FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
       FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
-  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
-                          FAN_OPEN, AT_FDCWD, top.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_OPEN,
+                          AT_FDCWD, top.path().c_str()));
   // More events than the default queue holds, none of them mergeable.
   constexpr int kQueue = 16384;
   DisableSave ds;  // Too many syscalls to save after each one.
@@ -958,7 +962,8 @@ TEST(FanotifyTest, OverlayInodeMarkIsPerName) {
   ASSERT_THAT(link(a.c_str(), b.c_str()), SyscallSucceeds());
   FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
       FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
-  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, a.c_str()));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, a.c_str()));
   auto evs = EventsAfter(g.get(), [&] { Open(b, O_RDONLY).IgnoreError(); });
   struct statfs sfs;
   ASSERT_THAT(statfs(dir.path().c_str(), &sfs), SyscallSucceeds());
@@ -1161,8 +1166,8 @@ TEST(FanotifyPermTest, ListenerReadsOwnEventFdUnderAccessPerm) {
   TempPath mnt;
   if (!IsRunningOnGvisor()) {
     mnt = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-    unmount = ASSERT_NO_ERRNO_AND_VALUE(
-        Mount("", mnt.path(), "tmpfs", 0, "", 0));
+    unmount =
+        ASSERT_NO_ERRNO_AND_VALUE(Mount("", mnt.path(), "tmpfs", 0, "", 0));
     base = mnt.path();
   }
   auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base));
@@ -1345,9 +1350,9 @@ TEST(FanotifyPermTest, DenyEveryReadPath) {
     EXPECT_THAT(preadv2(in.get(), &iov, 1, 0, 0), SyscallFailsWithErrno(EPERM));
     EXPECT_THAT(sendfile(o.get(), in.get(), nullptr, 6),
                 SyscallFailsWithErrno(EPERM));
-    EXPECT_THAT(syscall(SYS_copy_file_range, in.get(), nullptr, o.get(),
-                        nullptr, 6, 0),
-                SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(
+        syscall(SYS_copy_file_range, in.get(), nullptr, o.get(), nullptr, 6, 0),
+        SyscallFailsWithErrno(EPERM));
   });
 }
 
@@ -1357,8 +1362,8 @@ TEST(FanotifyPermTest, DenyGetdentsAndAio) {
   auto f = ASSERT_NO_ERRNO_AND_VALUE(
       TempPath::CreateFileWith(dir.path(), "abcdef", 0644));
   PermEventsDuring(dir.path(), FAN_DENY, [&] {
-    FileDescriptor d = ASSERT_NO_ERRNO_AND_VALUE(
-        Open(dir.path(), O_RDONLY | O_DIRECTORY));
+    FileDescriptor d =
+        ASSERT_NO_ERRNO_AND_VALUE(Open(dir.path(), O_RDONLY | O_DIRECTORY));
     char buf[256];
     EXPECT_THAT(syscall(SYS_getdents64, d.get(), buf, sizeof(buf)),
                 SyscallFailsWithErrno(EPERM));
@@ -1390,8 +1395,7 @@ TEST(FanotifyPermTest, ExecReadsAreChecked) {
   int n = PermEventsDuring(exe.path(), FAN_DENY, [&] {
     pid_t c = fork();
     if (c == 0) {
-      execl(exe.path().c_str(), "fanotify_test", "--gtest_list_tests",
-            nullptr);
+      execl(exe.path().c_str(), "fanotify_test", "--gtest_list_tests", nullptr);
       _exit(errno == EPERM ? 42 : 43);
     }
     int status;
@@ -1425,9 +1429,9 @@ TEST(FanotifyTest, Fdinfo) {
               ::testing::ContainsRegex("fanotify sdev:[0-9a-f]+ "
                                        "mflags:0 mask:2 ignored_mask:0\n"));
   // Linux adds file handle fields after this; gVisor has no file handles.
-  EXPECT_THAT(info, ::testing::ContainsRegex(
-                        "fanotify ino:[0-9a-f]+ sdev:[0-9a-f]+ "
-                        "mflags:0 mask:1 ignored_mask:0"));
+  EXPECT_THAT(info,
+              ::testing::ContainsRegex("fanotify ino:[0-9a-f]+ sdev:[0-9a-f]+ "
+                                       "mflags:0 mask:1 ignored_mask:0"));
 }
 
 TEST(FanotifyTest, EpollAfterRestore) {

@@ -1037,8 +1037,8 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	// Create the file on the upper layer, and get an FD representing it.
 	createCreds := parent.credsForCreate(creds, parent.isSGIDSet())
 	upperFD, err := vfsObj.OpenAt(ctx, createCreds, &pop, &vfs.OpenOptions{
-		Flags: opts.Flags&^vfs.FileCreationFlags | linux.O_CREAT | linux.O_EXCL,
-		Mode:  opts.Mode,
+		Flags:    opts.Flags&^vfs.FileCreationFlags | linux.O_CREAT | linux.O_EXCL,
+		Mode:     opts.Mode,
 		NoNotify: true,
 	})
 	if err != nil {

@@ -43,7 +43,7 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 			Root:  layerVD,
 			Start: layerVD,
 		}, &vfs.OpenOptions{
-			Flags: linux.O_RDONLY | linux.O_DIRECTORY,
+			Flags:    linux.O_RDONLY | linux.O_DIRECTORY,
 			NoNotify: true,
 		})
 		if err != nil {
@@ -184,7 +184,7 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 			Root:  layerVD,
 			Start: layerVD,
 		}, &vfs.OpenOptions{
-			Flags: linux.O_RDONLY | linux.O_DIRECTORY,
+			Flags:    linux.O_RDONLY | linux.O_DIRECTORY,
 			NoNotify: true,
 		})
 		if err != nil {
