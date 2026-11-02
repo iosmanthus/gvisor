@@ -259,6 +259,12 @@ syscall_test(
 )
 
 syscall_test(
+    size = "medium",
+    add_overlay = True,
+    test = "//test/syscalls/linux:fanotify_test",
+)
+
+syscall_test(
     size = "large",
     shard_count = most_shards,
     test = "//test/syscalls/linux:fcntl_test",

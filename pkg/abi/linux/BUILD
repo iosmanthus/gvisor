@@ -29,6 +29,7 @@ go_library(
         "eventfd.go",
         "exec.go",
         "fadvise.go",
+        "fanotify.go",
         "fcntl.go",
         "file.go",
         "file_amd64.go",
