@@ -44,6 +44,7 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 			Start: layerVD,
 		}, &vfs.OpenOptions{
 			Flags: linux.O_RDONLY | linux.O_DIRECTORY,
+			NoNotify: true,
 		})
 		if err != nil {
 			readdirErr = err
@@ -184,6 +185,7 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 			Start: layerVD,
 		}, &vfs.OpenOptions{
 			Flags: linux.O_RDONLY | linux.O_DIRECTORY,
+			NoNotify: true,
 		})
 		if err != nil {
 			readdirErr = err
@@ -290,7 +292,7 @@ func (fd *directoryFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 		Root:  d.upperVD,
 		Start: d.upperVD,
 	}
-	upperFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &pop, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
+	upperFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &pop, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY, NoNotify: true})
 	if err != nil {
 		return err
 	}

@@ -970,10 +970,14 @@ func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *
 	}
 
 	layerVD, isUpper := d.topLayerInfo()
+	// The layer file gives no events; vfs.OpenAt gives the events of the
+	// overlay file, with the caller's NoNotify.
+	layerOpts := *opts
+	layerOpts.NoNotify = true
 	layerFD, err := rp.VirtualFilesystem().OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 		Root:  layerVD,
 		Start: layerVD,
-	}, opts)
+	}, &layerOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1035,6 +1039,7 @@ func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.Resolving
 	upperFD, err := vfsObj.OpenAt(ctx, createCreds, &pop, &vfs.OpenOptions{
 		Flags: opts.Flags&^vfs.FileCreationFlags | linux.O_CREAT | linux.O_EXCL,
 		Mode:  opts.Mode,
+		NoNotify: true,
 	})
 	if err != nil {
 		if haveUpperWhiteout {

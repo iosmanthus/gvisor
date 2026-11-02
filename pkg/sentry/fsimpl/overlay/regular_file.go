@@ -82,6 +82,7 @@ func (fd *regularFileFD) currentFDLocked(ctx context.Context) (*vfs.FileDescript
 			Start: upperVD,
 		}, &vfs.OpenOptions{
 			Flags: statusFlags,
+			NoNotify: true,
 		})
 		if err != nil {
 			return nil, err

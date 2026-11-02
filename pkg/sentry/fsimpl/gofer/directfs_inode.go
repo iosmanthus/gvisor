@@ -289,6 +289,12 @@ func (i *directfsInode) openHandle(ctx context.Context, flags uint32, d *dentry)
 	if got, want := stat.Mode&unix.S_IFMT, i.inode.fileType(); got != want {
 		return noHandle, unix.ESTALE
 	}
+	// The name can point to another file now (for example after a rename or
+	// an unlink and create on the host). Never attach the handle of another
+	// file to this inode.
+	if inoKeyFromStat(&stat) != i.inoKey {
+		return noHandle, unix.ESTALE
+	}
 	if i.inode.fileType() == unix.S_IFCHR {
 		if unix.Major(stat.Rdev) != i.inode.rdevMajor || unix.Minor(stat.Rdev) != i.inode.rdevMinor {
 			return noHandle, unix.ESTALE

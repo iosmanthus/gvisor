@@ -23,6 +23,7 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -898,6 +899,60 @@ TEST(FanotifyTest, PollAndEpoll) {
   EXPECT_THAT(RetryEINTR(epoll_wait)(ep.get(), &ev, 1, 1000),
               SyscallSucceedsWithValue(1));
   EXPECT_EQ(ev.events, EPOLLIN | EPOLLRDNORM);
+}
+
+constexpr int64_t kOverlayfsSuperMagic = 0x794c7630;
+
+TEST(FanotifyTest, RootFilesystemEventsWithCopyUp) {
+  SkipIfNoSysAdmin();
+  // The runner may put lower.txt in the test directory before the sandbox
+  // starts; on an overlay root it is then in the lower layer, and opening it
+  // for writing copies it up.
+  std::string f = JoinPath(GetAbsoluteTestTmpdir(), "lower.txt");
+  if (access(f.c_str(), F_OK) != 0) {
+    ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
+  }
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE,
+                          AT_FDCWD, GetAbsoluteTestTmpdir().c_str()));
+  auto evs = EventsAfter(g.get(), [&] {
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f, O_RDWR));
+    char c;
+    ASSERT_THAT(read(fd.get(), &c, 1), SyscallSucceeds());
+    ASSERT_THAT(write(fd.get(), "x", 1), SyscallSucceeds());
+  });
+  uint64_t all = 0;
+  for (auto& e : evs) {
+    // Never a path of an overlay layer.
+    EXPECT_EQ(e.path, f);
+    all |= e.mask;
+  }
+  EXPECT_EQ(all, FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE_WRITE);
+}
+
+TEST(FanotifyTest, OverlayInodeMarkIsPerName) {
+  SkipIfNoSysAdmin();
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  std::string a = JoinPath(dir.path(), "a");
+  std::string b = JoinPath(dir.path(), "b");
+  ASSERT_NO_ERRNO(CreateWithContents(a, "x"));
+  ASSERT_THAT(link(a.c_str(), b.c_str()), SyscallSucceeds());
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, a.c_str()));
+  auto evs = EventsAfter(g.get(), [&] { Open(b, O_RDONLY).IgnoreError(); });
+  struct statfs sfs;
+  ASSERT_THAT(statfs(dir.path().c_str(), &sfs), SyscallSucceeds());
+  if (IsRunningOnGvisor() && sfs.f_type == kOverlayfsSuperMagic) {
+    // gVisor overlay has no shared inode for hard links: a mark through one
+    // name does not see the other name. This is the same limit as for
+    // inotify watches.
+    EXPECT_TRUE(evs.empty());
+  } else {
+    EXPECT_EQ(evs.size(), 1);
+  }
 }
 
 }  // namespace

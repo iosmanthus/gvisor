@@ -18,6 +18,7 @@ import (
 	"errors"
 
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
@@ -31,9 +32,15 @@ var ErrFanotifyStale = errors.New("fanotify: cannot open the event object again"
 // and no DAC check, and the new file gives no events.
 func (vfs *VirtualFilesystem) OpenFanotifyEventFile(ctx context.Context, creds *auth.Credentials, vd VirtualDentry, flags uint32) (*FileDescription, error) {
 	pop := PathOperation{Root: vd, Start: vd}
-	return vfs.OpenAt(ctx, creds, &pop, &OpenOptions{
+	fd, err := vfs.OpenAt(ctx, creds, &pop, &OpenOptions{
 		Flags:        flags,
 		NoNotify:     true,
 		SkipDACCheck: true,
 	})
+	// A remote file that was deleted or replaced cannot be opened again (gofer
+	// reopens by name). Linux drops such events (EOPENSTALE).
+	if linuxerr.Equals(linuxerr.ESTALE, err) || linuxerr.Equals(linuxerr.ENOENT, err) {
+		return nil, ErrFanotifyStale
+	}
+	return fd, err
 }
