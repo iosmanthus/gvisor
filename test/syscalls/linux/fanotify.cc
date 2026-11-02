@@ -1379,6 +1379,35 @@ TEST(FanotifyPermTest, ExecReadsAreChecked) {
   EXPECT_GE(n, 1);
 }
 
+TEST(FanotifyTest, Fdinfo) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN,
+                          AT_FDCWD, top.path().c_str()));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_MODIFY, AT_FDCWD, top.path().c_str()));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS, AT_FDCWD, top.path().c_str()));
+  std::string info = ASSERT_NO_ERRNO_AND_VALUE(
+      GetContents(absl::StrCat("/proc/self/fdinfo/", g.get())));
+  // Linux prints the init flags and event_f_flags (with O_LARGEFILE).
+  EXPECT_THAT(info, ::testing::ContainsRegex(
+                        "fanotify flags:[0-9a-f]+ event-flags:[0-9a-f]+\n"));
+  EXPECT_THAT(info,
+              ::testing::ContainsRegex("fanotify mnt_id:[0-9a-f]+ "
+                                       "mflags:0 mask:20 ignored_mask:0\n"));
+  EXPECT_THAT(info,
+              ::testing::ContainsRegex("fanotify sdev:[0-9a-f]+ "
+                                       "mflags:0 mask:2 ignored_mask:0\n"));
+  // Linux adds file handle fields after this; gVisor has no file handles.
+  EXPECT_THAT(info, ::testing::ContainsRegex(
+                        "fanotify ino:[0-9a-f]+ sdev:[0-9a-f]+ "
+                        "mflags:0 mask:1 ignored_mask:0"));
+}
+
 }  // namespace
 
 }  // namespace testing

@@ -193,7 +193,7 @@ func FanotifyMark(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 	if err := vfsObj.AccessAt(t, t.Credentials(), vfs.MayRead, &tpop.pop); err != nil {
 		return 0, nil, err
 	}
-	stat, err := vfsObj.StatAt(t, t.Credentials(), &vfs.PathOperation{Root: vd, Start: vd}, &vfs.StatOptions{Mask: linux.STATX_TYPE})
+	stat, err := vfsObj.StatAt(t, t.Credentials(), &vfs.PathOperation{Root: vd, Start: vd}, &vfs.StatOptions{Mask: linux.STATX_TYPE | linux.STATX_INO})
 	if err != nil {
 		return 0, nil, err
 	}
@@ -215,5 +215,5 @@ func FanotifyMark(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 		mask &^= linux.FAN_EVENT_ON_CHILD
 	}
 	return 0, nil, g.UpdateMark(t, vd, kind, cmd == linux.FAN_MARK_ADD, mask, ignored,
-		flags&linux.FAN_MARK_IGNORED_SURV_MODIFY != 0)
+		flags&linux.FAN_MARK_IGNORED_SURV_MODIFY != 0, stat.Ino, uint64(linux.MakeDeviceID(uint16(stat.DevMajor), stat.DevMinor)))
 }

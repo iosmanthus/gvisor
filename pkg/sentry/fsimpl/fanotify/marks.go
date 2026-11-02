@@ -15,6 +15,9 @@
 package fanotify
 
 import (
+	"bytes"
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -43,7 +46,7 @@ func (g *Group) pruneLocked() {
 // UpdateMark implements fanotify_mark(2) FAN_MARK_ADD (add is true) and
 // FAN_MARK_REMOVE after the syscall layer checked and normalized the
 // arguments. If ignored is true, mask applies to the ignored mask.
-func (g *Group) UpdateMark(ctx context.Context, vd vfs.VirtualDentry, kind uint8, add bool, mask uint64, ignored, surv bool) error {
+func (g *Group) UpdateMark(ctx context.Context, vd vfs.VirtualDentry, kind uint8, add bool, mask uint64, ignored, surv bool, ino, dev uint64) error {
 	var markMask, ignoreMask uint64
 	if ignored {
 		ignoreMask = mask
@@ -53,7 +56,7 @@ func (g *Group) UpdateMark(ctx context.Context, vd vfs.VirtualDentry, kind uint8
 	g.markMu.Lock()
 	defer g.markMu.Unlock()
 	g.pruneLocked()
-	m, created, err := g.vfsObj.FanotifyUpdateMark(ctx, g, vd, kind, add, markMask, ignoreMask, surv, func() bool {
+	m, created, err := g.vfsObj.FanotifyUpdateMark(ctx, g, vd, kind, add, markMask, ignoreMask, surv, ino, dev, func() bool {
 		return g.flags&linux.FAN_UNLIMITED_MARKS != 0 || len(g.marks) < MaxMarks
 	})
 	if err != nil {
@@ -76,4 +79,30 @@ func (g *Group) Flush(ctx context.Context, kind uint8) {
 		}
 	}
 	g.pruneLocked()
+}
+
+// FDInfo implements vfs.FDInfoProvider. The format is that of Linux
+// fs/notify/fdinfo.c, without the file handle fields of inode marks.
+func (g *Group) FDInfo(ctx context.Context, buf *bytes.Buffer) {
+	fmt.Fprintf(buf, "fanotify flags:%x event-flags:%x\n", g.flags, g.eventFFlags)
+	g.markMu.Lock()
+	defer g.markMu.Unlock()
+	for _, m := range g.marks {
+		if m.Detached() {
+			continue
+		}
+		var mflags uint32
+		if m.SurvivesModify() {
+			mflags |= linux.FAN_MARK_IGNORED_SURV_MODIFY
+		}
+		ino, dev := m.StatIDs()
+		switch m.Kind() {
+		case vfs.FanotifyMarkInode:
+			fmt.Fprintf(buf, "fanotify ino:%x sdev:%x mflags:%x mask:%x ignored_mask:%x\n", ino, dev, mflags, m.Mask(), m.Ignore())
+		case vfs.FanotifyMarkMount:
+			fmt.Fprintf(buf, "fanotify mnt_id:%x mflags:%x mask:%x ignored_mask:%x\n", m.MountID(), mflags, m.Mask(), m.Ignore())
+		case vfs.FanotifyMarkFilesystem:
+			fmt.Fprintf(buf, "fanotify sdev:%x mflags:%x mask:%x ignored_mask:%x\n", dev, mflags, m.Mask(), m.Ignore())
+		}
+	}
 }

@@ -15,6 +15,8 @@
 package vfs
 
 import (
+	"bytes"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -106,6 +108,11 @@ type FanotifyMark struct {
 	inode *Dentry
 	mount *Mount
 	fs    *Filesystem
+
+	// ino and dev identify the object in fdinfo. They are set when the
+	// mark is created.
+	ino uint64
+	dev uint64
 }
 
 // Group returns the group of m.
@@ -132,6 +139,16 @@ func (m *FanotifyMark) Ignore() uint64 {
 // SurvivesModify returns true if FAN_MARK_IGNORED_SURV_MODIFY is set.
 func (m *FanotifyMark) SurvivesModify() bool {
 	return m.surv.Load()
+}
+
+// StatIDs returns the inode number and device of the object of m.
+func (m *FanotifyMark) StatIDs() (ino, dev uint64) {
+	return m.ino, m.dev
+}
+
+// MountID returns the ID of the mount of a mount mark.
+func (m *FanotifyMark) MountID() uint64 {
+	return m.mount.ID
 }
 
 // Detached returns true if m is no longer on its object.
@@ -240,7 +257,7 @@ func fanotifyContainerFor(vd VirtualDentry, kind uint8) (*fanotifyMarks, error) 
 // bits from an object without a mark of g returns ENOENT.
 //
 // Preconditions: The caller holds g's mark lock and no vfs lock.
-func (vfs *VirtualFilesystem) FanotifyUpdateMark(ctx context.Context, g FanotifyGroup, vd VirtualDentry, kind uint8, add bool, mask, ignore uint64, surv bool, newMarkAllowed func() bool) (m *FanotifyMark, created bool, err error) {
+func (vfs *VirtualFilesystem) FanotifyUpdateMark(ctx context.Context, g FanotifyGroup, vd VirtualDentry, kind uint8, add bool, mask, ignore uint64, surv bool, ino, dev uint64, newMarkAllowed func() bool) (m *FanotifyMark, created bool, err error) {
 	c, err := fanotifyContainerFor(vd, kind)
 	if err != nil {
 		return nil, false, err
@@ -276,7 +293,7 @@ func (vfs *VirtualFilesystem) FanotifyUpdateMark(ctx context.Context, g Fanotify
 			c.mu.Unlock()
 			return nil, false, linuxerr.ENOSPC
 		}
-		m = &FanotifyMark{vfs: vfs, group: g, kind: kind, container: c}
+		m = &FanotifyMark{vfs: vfs, group: g, kind: kind, container: c, ino: ino, dev: dev}
 		switch kind {
 		case FanotifyMarkMount:
 			m.mount = vd.mount
@@ -331,4 +348,11 @@ func (m *FanotifyMark) afterDetach(ctx context.Context) {
 	if ws := m.inode.Watches(); ws != nil && ws.Size() == 0 {
 		m.inode.OnZeroWatches(ctx)
 	}
+}
+
+// FDInfoProvider is implemented by FileDescriptionImpls that print
+// type-specific lines in /proc/[pid]/fdinfo/[fd], after the common fields.
+type FDInfoProvider interface {
+	// FDInfo appends the lines to buf.
+	FDInfo(ctx context.Context, buf *bytes.Buffer)
 }
