@@ -505,6 +505,11 @@ func (ns *PIDNamespace) ThreadGroupsAppend(tgs []*ThreadGroup) []*ThreadGroup {
 	return tgs
 }
 
+// Parent returns the parent of ns, or nil if ns is the root PID namespace.
+func (ns *PIDNamespace) Parent() *PIDNamespace {
+	return ns.parent
+}
+
 // UserNamespace returns the user namespace associated with PID namespace ns.
 func (ns *PIDNamespace) UserNamespace() *auth.UserNamespace {
 	return ns.userns

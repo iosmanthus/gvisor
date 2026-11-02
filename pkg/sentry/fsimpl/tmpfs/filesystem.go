@@ -478,7 +478,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		}
 	}
 	if !afterCreate {
-		if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {
+		if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil && !opts.SkipDACCheck {
 			return nil, err
 		}
 		if ats.MayWrite() {

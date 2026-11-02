@@ -151,6 +151,7 @@ go_library(
         "fanotify.go",
         "fanotify_dispatch.go",
         "fanotify_marks_mutex.go",
+        "fanotify_open.go",
         "file_description.go",
         "file_description_impl_util.go",
         "file_description_refs.go",

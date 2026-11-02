@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -64,6 +63,29 @@ type Group struct {
 	//
 	// +checklocks:markMu
 	marks []*vfs.FanotifyMark
+
+	// queueMu protects the event queue. It is the innermost fanotify lock.
+	queueMu groupQueueMutex `state:"nosave"`
+
+	// events is the queue of events not yet read.
+	//
+	// +checklocks:queueMu
+	events eventList
+
+	// qlen is the length of events.
+	//
+	// +checklocks:queueMu
+	qlen int
+
+	// overflowQueued is true while the overflow event is in events.
+	//
+	// +checklocks:queueMu
+	overflowQueued bool
+
+	// shutdown is set when the group is released. No event is queued after.
+	//
+	// +checklocks:queueMu
+	shutdown bool
 }
 
 var _ vfs.FileDescriptionImpl = (*Group)(nil)
@@ -116,11 +138,6 @@ func (g *Group) Priority() int {
 	}
 }
 
-// HandleEvent implements vfs.FanotifyGroup.HandleEvent.
-func (g *Group) HandleEvent(ctx context.Context, ev *vfs.FanotifyEventInfo) error {
-	return nil
-}
-
 // Release implements vfs.FileDescriptionImpl.Release.
 func (g *Group) Release(ctx context.Context) {
 	g.markMu.Lock()
@@ -129,17 +146,23 @@ func (g *Group) Release(ctx context.Context) {
 	}
 	g.marks = nil
 	g.markMu.Unlock()
+
+	var drop []vfs.VirtualDentry
+	g.queueMu.Lock()
+	g.shutdown = true
+	for ev := g.events.Front(); ev != nil; ev = g.events.Front() {
+		g.events.Remove(ev)
+		if ev.vd.Ok() {
+			drop = append(drop, ev.vd)
+		}
+	}
+	g.qlen = 0
+	g.queueMu.Unlock()
+	// Drop references without queueMu: a drop can run filesystem teardown.
+	for _, vd := range drop {
+		vd.DecRef(ctx)
+	}
 	g.vfsObj.FanotifyGroupsAdd(-1)
-}
-
-// Read implements vfs.FileDescriptionImpl.Read.
-func (g *Group) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
-	return 0, linuxerr.ErrWouldBlock
-}
-
-// Readiness implements waiter.Waitable.Readiness.
-func (g *Group) Readiness(mask waiter.EventMask) waiter.EventMask {
-	return 0
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.

@@ -15,13 +15,17 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/fanotify.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +41,7 @@
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+#include "test/util/thread_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -348,6 +353,270 @@ TEST(FanotifyTest, MarksDoNotKeepMountBusy) {
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_FLUSH | FAN_MARK_MOUNT, 0,
                             AT_FDCWD, nullptr),
               SyscallSucceeds());
+}
+
+// EventsAfter runs fn, then returns all events that arrive within 200 ms of
+// the last one.
+std::vector<FanEvent> EventsAfter(int g, const std::function<void()>& fn) {
+  fn();
+  std::vector<FanEvent> all;
+  while (true) {
+    auto evs = ReadEvents(g, 200);
+    if (!evs.ok() || evs.ValueOrDie().empty()) {
+      break;
+    }
+    for (auto& e : evs.ValueOrDie()) {
+      all.push_back(std::move(e));
+    }
+  }
+  return all;
+}
+
+PosixErrorOr<FileDescriptor> InotifyInit1(int flags) {
+  int fd = inotify_init1(flags);
+  if (fd < 0) {
+    return PosixError(errno, "inotify_init1");
+  }
+  return FileDescriptor(fd);
+}
+
+TEST(FanotifyTest, InodeMarkSeesOnlyItsFile) {
+  SkipIfNoSysAdmin();
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto a = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(dir.path(), "aaa", 0644));
+  auto b = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(dir.path(), "bbb", 0644));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD,
+                          FAN_OPEN | FAN_ACCESS | FAN_CLOSE_NOWRITE, AT_FDCWD,
+                          a.path().c_str()));
+  auto evs = EventsAfter(g.get(), [&] {
+    char c;
+    FileDescriptor fa = ASSERT_NO_ERRNO_AND_VALUE(Open(a.path(), O_RDONLY));
+    ASSERT_THAT(read(fa.get(), &c, 1), SyscallSucceedsWithValue(1));
+    FileDescriptor fb = ASSERT_NO_ERRNO_AND_VALUE(Open(b.path(), O_RDONLY));
+    ASSERT_THAT(read(fb.get(), &c, 1), SyscallSucceedsWithValue(1));
+  });
+  uint64_t all = 0;
+  for (auto& e : evs) {
+    EXPECT_EQ(e.path, a.path());
+    EXPECT_EQ(e.pid, getpid());
+    all |= e.mask;
+  }
+  EXPECT_EQ(all, FAN_OPEN | FAN_ACCESS | FAN_CLOSE_NOWRITE);
+}
+
+TEST(FanotifyTest, MountMarkExcludesBindMountAndSubmount) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string sub = JoinPath(top.path(), "sub");
+  ASSERT_THAT(mkdir(sub.c_str(), 0755), SyscallSucceeds());
+  auto subm = ASSERT_NO_ERRNO_AND_VALUE(Mount("", sub, "tmpfs", 0, "", 0));
+  auto bind = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto bindm = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(top.path(), bind.path(), "", MS_BIND, "", 0));
+  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(top.path(), "f"), "x"));
+  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(sub, "f"), "x"));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN,
+                          AT_FDCWD, top.path().c_str()));
+  auto evs = EventsAfter(g.get(), [&] {
+    Open(JoinPath(top.path(), "f"), O_RDONLY).IgnoreError();
+    Open(JoinPath(sub, "f"), O_RDONLY).IgnoreError();
+    Open(JoinPath(bind.path(), "f"), O_RDONLY).IgnoreError();
+  });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].path, JoinPath(top.path(), "f"));
+}
+
+TEST(FanotifyTest, FilesystemMarkSeesAllMounts) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  auto bind = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto bindm = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(top.path(), bind.path(), "", MS_BIND, "", 0));
+  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(top.path(), "f"), "x"));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN, AT_FDCWD, top.path().c_str()));
+  auto evs = EventsAfter(g.get(), [&] {
+    Open(JoinPath(top.path(), "f"), O_RDONLY).IgnoreError();
+    Open(JoinPath(bind.path(), "f"), O_RDONLY).IgnoreError();
+  });
+  EXPECT_EQ(evs.size(), 2);
+}
+
+TEST(FanotifyTest, EventMasksAndSpecialFiles) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string f = JoinPath(top.path(), "f");
+  std::string fifo = JoinPath(top.path(), "p");
+  ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
+  ASSERT_THAT(mkfifo(fifo.c_str(), 0644), SyscallSucceeds());
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(
+      g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+      FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE | FAN_ONDIR, AT_FDCWD,
+      top.path().c_str()));
+  auto evs = EventsAfter(g.get(), [&] {
+    // O_TRUNC and ftruncate give no fanotify event without FID reporting.
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f, O_RDWR | O_TRUNC));
+    ASSERT_THAT(write(fd.get(), "x", 1), SyscallSucceeds());
+    ASSERT_THAT(ftruncate(fd.get(), 0), SyscallSucceeds());
+    ASSERT_THAT(fallocate(fd.get(), 0, 0, 4096), SyscallSucceeds());
+    // A FIFO gives no event.
+    FileDescriptor p = ASSERT_NO_ERRNO_AND_VALUE(Open(fifo, O_RDWR));
+  });
+  uint64_t all = 0;
+  for (auto& e : evs) {
+    EXPECT_EQ(e.path, f);
+    EXPECT_EQ(e.mask & (FAN_ONDIR | FAN_EVENT_ON_CHILD), 0);
+    all |= e.mask;
+  }
+  EXPECT_EQ(all, FAN_OPEN | FAN_MODIFY | FAN_CLOSE_WRITE);
+}
+
+TEST(FanotifyTest, EventFdIsSilentAndReopensUnlinked) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string f = JoinPath(top.path(), "f");
+  ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  FileDescriptor g2 = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN | FAN_ACCESS | FAN_CLOSE, AT_FDCWD,
+                          top.path().c_str()));
+  {
+    FileDescriptor w = ASSERT_NO_ERRNO_AND_VALUE(Open(f, O_WRONLY));
+    ASSERT_THAT(unlink(f.c_str()), SyscallSucceeds());
+  }  // CLOSE_WRITE on an unlinked file.
+  auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 1000));
+  ASSERT_FALSE(evs.empty());
+  EXPECT_EQ(evs.back().path, f + " (deleted)");
+  // Watch with a second group and with inotify, then use the event fd.
+  ASSERT_NO_ERRNO(FanMark(g2.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN | FAN_ACCESS | FAN_CLOSE, AT_FDCWD,
+                          top.path().c_str()));
+  ASSERT_THAT(inotify_add_watch(in.get(), top.path().c_str(), IN_ALL_EVENTS),
+              SyscallSucceeds());
+  char buf[8];
+  // The event fd has event_f_flags (O_RDONLY).
+  EXPECT_THAT(read(evs.back().fd.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(3));
+  evs.back().fd.reset();
+  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g2.get(), 300)).empty());
+  char ibuf[256];
+  EXPECT_THAT(read(in.get(), ibuf, sizeof(ibuf)),
+              SyscallFailsWithErrno(EAGAIN));
+}
+
+TEST(FanotifyTest, ReadEdgeCases) {
+  SkipIfNoSysAdmin();
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  char tiny[4];
+  // An empty queue gives EAGAIN, also with a small buffer.
+  EXPECT_THAT(read(g.get(), tiny, sizeof(tiny)),
+              SyscallFailsWithErrno(EAGAIN));
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f.path().c_str()));
+  Open(f.path(), O_RDONLY).IgnoreError();
+  EXPECT_THAT(read(g.get(), tiny, sizeof(tiny)),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+// LowestFreeFd returns the number that the next new fd gets.
+int LowestFreeFd() {
+  int fd = open("/dev/null", O_RDONLY);
+  TEST_PCHECK(fd >= 0);
+  close(fd);
+  return fd;
+}
+
+TEST(FanotifyTest, ReadFaultAndEmfileDoNotLeakFds) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  auto f2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f.path().c_str()));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f2.path().c_str()));
+  Open(f.path(), O_RDONLY).IgnoreError();
+  Open(f2.path(), O_RDONLY).IgnoreError();
+  // The buffer ends at an unmapped page: the first event fits, the second
+  // does not.
+  char* mem = static_cast<char*>(mmap(nullptr, 2 * kPageSize,
+                                      PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  ASSERT_NE(mem, MAP_FAILED);
+  ASSERT_THAT(munmap(mem + kPageSize, kPageSize), SyscallSucceeds());
+  int free_before = LowestFreeFd();
+  char* buf = mem + kPageSize - sizeof(fanotify_event_metadata);
+  EXPECT_THAT(read(g.get(), buf, 2 * sizeof(fanotify_event_metadata)),
+              SyscallFailsWithErrno(EFAULT));
+  // Linux keeps the first event: its fd is installed.
+  auto* md = reinterpret_cast<fanotify_event_metadata*>(buf);
+  EXPECT_EQ(md->fd, free_before);
+  close(md->fd);
+  // The faulted second event left no fd behind.
+  EXPECT_EQ(LowestFreeFd(), free_before);
+  munmap(mem, kPageSize);
+  // EMFILE while the event fd is installed.
+  Open(f.path(), O_RDONLY).IgnoreError();
+  struct rlimit old;
+  ASSERT_THAT(getrlimit(RLIMIT_NOFILE, &old), SyscallSucceeds());
+  struct rlimit lim = old;
+  lim.rlim_cur = LowestFreeFd();
+  ASSERT_THAT(setrlimit(RLIMIT_NOFILE, &lim), SyscallSucceeds());
+  char ok[64] __attribute__((aligned(8)));
+  EXPECT_THAT(read(g.get(), ok, sizeof(ok)), SyscallFailsWithErrno(EMFILE));
+  ASSERT_THAT(setrlimit(RLIMIT_NOFILE, &old), SyscallSucceeds());
+}
+
+TEST(FanotifyTest, TwoReadersGetEachEventOnce) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN, AT_FDCWD, top.path().c_str()));
+  constexpr int kFiles = 200;
+  for (int i = 0; i < kFiles; i++) {
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(JoinPath(top.path(), absl::StrCat("f", i)), O_CREAT | O_RDONLY,
+             0644));
+  }
+  std::atomic<int> total(0);
+  auto drain = [&] {
+    while (true) {
+      auto evs = ReadEvents(g.get(), 200);
+      if (!evs.ok() || evs.ValueOrDie().empty()) {
+        return;
+      }
+      total += evs.ValueOrDie().size();
+    }
+  };
+  ScopedThread t1(drain);
+  ScopedThread t2(drain);
+  t1.Join();
+  t2.Join();
+  EXPECT_EQ(total.load(), kFiles);
 }
 
 }  // namespace

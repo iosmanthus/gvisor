@@ -1104,7 +1104,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		// ELOOP below, also per may_open().
 		return nil, linuxerr.EACCES
 	}
-	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
+	if err := d.checkPermissions(rp.Credentials(), ats); err != nil && !opts.SkipDACCheck {
 		return nil, err
 	}
 	if ats.MayWrite() {
