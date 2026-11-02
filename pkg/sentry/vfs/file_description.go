@@ -84,6 +84,10 @@ type FileDescription struct {
 
 	usedLockBSD atomicbitops.Uint32
 
+	// fanotifyType caches the S_IFMT bits of the file for fanotify. It is 0
+	// until the first fanotify event on fd needs it.
+	fanotifyType atomicbitops.Uint32 `state:"nosave"`
+
 	// impl is the FileDescriptionImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in FileDescription.
 	impl FileDescriptionImpl
@@ -108,6 +112,10 @@ func (fd *FileDescription) IsCreated() bool {
 //
 // +stateify savable
 type FileDescriptionOptions struct {
+	// If NoNotify is true, the file gives no inotify and no fanotify events
+	// (Linux FMODE_NONOTIFY). Only sentry code sets it.
+	NoNotify bool
+
 	// If AllowDirectIO is true, allow O_DIRECT to be set on the file.
 	AllowDirectIO bool
 
@@ -197,7 +205,7 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		if fd.IsWritable() {
 			ev = linux.IN_CLOSE_WRITE
 		}
-		fd.Dentry().InotifyWithParent(ctx, ev, 0, PathEvent)
+		fd.notify(ctx, ev, uint64(ev))
 
 		// Detach the set before taking any EpollInstance.interestMu:
 		// registering or deleting an interest takes interestMu before epollMu.
@@ -631,6 +639,9 @@ func (fd *FileDescription) SetStat(ctx context.Context, opts SetStatOptions) err
 	}
 	if ev := InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
 		fd.Dentry().InotifyWithParent(ctx, ev, 0, InodeEvent)
+		if ev&linux.IN_MODIFY != 0 && fd.vd.mount.vfs.fanotifyMarks.Load() != 0 {
+			fanotifyInodeModify(fd.vd.dentry, fd.vd.mount.fs)
+		}
 	}
 	return nil
 }
@@ -659,7 +670,7 @@ func (fd *FileDescription) Allocate(ctx context.Context, mode, offset, length ui
 	if err := fd.impl.Allocate(ctx, mode, offset, length); err != nil {
 		return err
 	}
-	fd.Dentry().InotifyWithParent(ctx, linux.IN_MODIFY, 0, PathEvent)
+	fd.notify(ctx, linux.IN_MODIFY, linux.FAN_MODIFY)
 	return nil
 }
 
@@ -702,7 +713,7 @@ func (fd *FileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.PRead(ctx, dst, offset, opts)
 	if n > 0 {
-		fd.Dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, PathEvent)
+		fd.notify(ctx, linux.IN_ACCESS, linux.FAN_ACCESS)
 	}
 	fsmetric.Reads.Increment()
 	fsmetric.FinishReadWait(fsmetric.ReadWait, start)
@@ -717,7 +728,7 @@ func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opt
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.Read(ctx, dst, opts)
 	if n > 0 {
-		fd.Dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, PathEvent)
+		fd.notify(ctx, linux.IN_ACCESS, linux.FAN_ACCESS)
 	}
 	fsmetric.Reads.Increment()
 	fsmetric.FinishReadWait(fsmetric.ReadWait, start)
@@ -736,7 +747,7 @@ func (fd *FileDescription) PWrite(ctx context.Context, src usermem.IOSequence, o
 	}
 	n, err := fd.impl.PWrite(ctx, src, offset, opts)
 	if n > 0 {
-		fd.Dentry().InotifyWithParent(ctx, linux.IN_MODIFY, 0, PathEvent)
+		fd.notify(ctx, linux.IN_MODIFY, linux.FAN_MODIFY)
 	}
 	return n, err
 }
@@ -748,7 +759,7 @@ func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, op
 	}
 	n, err := fd.impl.Write(ctx, src, opts)
 	if n > 0 {
-		fd.Dentry().InotifyWithParent(ctx, linux.IN_MODIFY, 0, PathEvent)
+		fd.notify(ctx, linux.IN_MODIFY, linux.FAN_MODIFY)
 	}
 	return n, err
 }
@@ -757,7 +768,7 @@ func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, op
 // IterDirents has been called since the last call to Seek, it continues
 // iteration from the end of the last call.
 func (fd *FileDescription) IterDirents(ctx context.Context, cb IterDirentsCallback) error {
-	defer fd.Dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, PathEvent)
+	defer fd.notify(ctx, linux.IN_ACCESS, linux.FAN_ACCESS)
 	return fd.impl.IterDirents(ctx, cb)
 }
 
@@ -1138,4 +1149,31 @@ func (fd *FileDescription) GetFilePrivileges(ctx context.Context) (auth.FilePriv
 // Credentials returns the credentials under which fd was opened.
 func (fd *FileDescription) Credentials() *auth.Credentials {
 	return fd.creds
+}
+
+// notify sends a path event for fd to inotify (inotifyEv) and fanotify
+// (fanEv). Files opened with NoNotify give no events.
+func (fd *FileDescription) notify(ctx context.Context, inotifyEv uint32, fanEv uint64) {
+	if fd.opts.NoNotify {
+		return
+	}
+	fd.Dentry().InotifyWithParent(ctx, inotifyEv, 0, PathEvent)
+	if vfs := fd.vd.mount.vfs; vfs.fanotifyMarks.Load() != 0 {
+		// Notification events cannot fail.
+		_ = vfs.fanotifyPathEvent(ctx, fd.vd, fd.fileType(ctx), fanEv)
+	}
+}
+
+// fileType returns the S_IFMT bits of fd's file, or 0 if they are not known.
+func (fd *FileDescription) fileType(ctx context.Context) uint32 {
+	if t := fd.fanotifyType.Load(); t != 0 {
+		return t
+	}
+	stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_TYPE})
+	if err != nil || stat.Mask&linux.STATX_TYPE == 0 {
+		return 0
+	}
+	t := uint32(stat.Mode) & linux.S_IFMT
+	fd.fanotifyType.Store(t)
+	return t
 }

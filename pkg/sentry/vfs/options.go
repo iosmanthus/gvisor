@@ -144,6 +144,14 @@ type OpenOptions struct {
 	// on the file, that the file is a regular file, and that the mount doesn't
 	// have MS_NOEXEC set.
 	FileExec bool
+
+	// NoNotify suppresses inotify and fanotify events for the new file (Linux
+	// FMODE_NONOTIFY). Only sentry code sets it.
+	NoNotify bool
+
+	// SkipDACCheck skips the DAC part of the open permission check, as Linux
+	// dentry_open() does for fanotify event files. Only sentry code sets it.
+	SkipDACCheck bool
 }
 
 // ReadOptions contains options to FileDescription.PRead(),

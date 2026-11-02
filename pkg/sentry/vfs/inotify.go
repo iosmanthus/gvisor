@@ -497,6 +497,13 @@ func (w *Watches) Notify(ctx context.Context, name string, events, cookie uint32
 	if hasExpired {
 		w.cleanupExpiredWatches(ctx)
 	}
+
+	// A modification without a path (truncate, utimes) clears the fanotify
+	// ignored masks of this inode that do not survive modification.
+	if et == InodeEvent && events&linux.IN_MODIFY != 0 && w.fanotify.interest.Load() != 0 {
+		var buf [fanotifySnapMax]fanotifySnap
+		w.fanotify.snapInto(buf[:0], fanRoleInode, linux.FAN_MODIFY)
+	}
 }
 
 // This function is relatively expensive and should only be called where there

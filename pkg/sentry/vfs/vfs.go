@@ -180,6 +180,10 @@ type VirtualFilesystem struct {
 	// fanotifyMarks is the number of fanotify marks on all objects. When it
 	// is zero, file events do no fanotify work.
 	fanotifyMarks atomicbitops.Int64
+
+	// fanotifyInodeMarks is the number of fanotify inode marks. When it is
+	// zero, file events do not look up parents for FAN_EVENT_ON_CHILD.
+	fanotifyInodeMarks atomicbitops.Int64
 }
 
 const renameInProgressMask = 1<<32 - 1
@@ -590,9 +594,21 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 			// See https://github.com/torvalds/linux/commit/7b8c9d7bb4570ee4800642009c8f2d9756004552,
 			// merged in Linux 6.5.
 			fdCleanup.Release()
-			fd.Dentry().InotifyWithParent(ctx, linux.IN_OPEN, 0, PathEvent)
-			if opts.Flags&linux.O_TRUNC != 0 && !fd.IsCreated() {
+			// The new file follows its caller, also when a filesystem (overlay)
+			// copied the options of an inner file.
+			fd.opts.NoNotify = opts.NoNotify
+			fanEv := uint64(linux.FAN_OPEN)
+			if opts.FileExec {
+				fanEv |= linux.FAN_OPEN_EXEC
+			}
+			fd.notify(ctx, linux.IN_OPEN, fanEv)
+			if opts.Flags&linux.O_TRUNC != 0 && !fd.IsCreated() && !fd.opts.NoNotify {
 				fd.Dentry().InotifyWithParent(ctx, linux.IN_MODIFY, 0, PathEvent)
+				// Truncation has no path in Linux (fsnotify_change()), so
+				// fanotify only clears ignored masks.
+				if vfs.fanotifyMarks.Load() != 0 {
+					fanotifyInodeModify(fd.vd.dentry, fd.vd.mount.fs)
+				}
 			}
 			return fd, nil
 		}

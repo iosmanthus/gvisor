@@ -199,6 +199,9 @@ func (c *fanotifyMarks) detachLocked(m *FanotifyMark) bool {
 	}
 	delete(c.marks, m.group.ID())
 	m.vfs.fanotifyMarks.Add(-1)
+	if m.kind == FanotifyMarkInode {
+		m.vfs.fanotifyInodeMarks.Add(-1)
+	}
 	return true
 }
 
@@ -287,6 +290,9 @@ func (vfs *VirtualFilesystem) FanotifyUpdateMark(ctx context.Context, g Fanotify
 		}
 		c.marks[g.ID()] = m
 		vfs.fanotifyMarks.Add(1)
+		if kind == FanotifyMarkInode {
+			vfs.fanotifyInodeMarks.Add(1)
+		}
 		created = true
 	}
 	m.mask.Store(m.mask.Load() | mask)
