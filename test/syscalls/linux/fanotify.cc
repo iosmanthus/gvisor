@@ -457,6 +457,28 @@ TEST(FanotifyTest, InodeMarkSeesOnlyItsFile) {
   EXPECT_EQ(all, FAN_OPEN | FAN_ACCESS | FAN_CLOSE_NOWRITE);
 }
 
+TEST(FanotifyTest, MarkOfDeletedFileAndSave) {
+  SkipIfNoSysAdmin();
+  std::string f = NewTempAbsPathInDir(GetAbsoluteTestTmpdir());
+  ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f.c_str()));
+  // The mark goes away with the file. A checkpoint must not save the deleted
+  // file through the group.
+  ASSERT_THAT(unlink(f.c_str()), SyscallSucceeds());
+  MaybeSave();
+  auto other = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "abc", 0644));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, other.path().c_str()));
+  auto evs = EventsAfter(
+      g.get(), [&] { ASSERT_NO_ERRNO(Open(other.path(), O_RDONLY)); });
+  ASSERT_EQ(evs.size(), 1);
+  EXPECT_EQ(evs[0].path, other.path());
+}
+
 TEST(FanotifyTest, MountMarkExcludesBindMountAndSubmount) {
   SkipIfNoSysAdmin();
   auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());

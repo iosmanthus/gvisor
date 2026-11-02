@@ -18,6 +18,14 @@ import (
 	"context"
 )
 
+// beforeSave drops the marks that vfs detached. A detached mark can point to
+// an object that cannot be saved, for example a deleted gofer dentry.
+func (g *Group) beforeSave() {
+	g.markMu.Lock()
+	g.pruneLocked()
+	g.markMu.Unlock()
+}
+
 // afterLoad rebuilds the state that is not saved.
 func (g *Group) afterLoad(context.Context) {
 	g.merge = make(map[mergeKey]*event)
