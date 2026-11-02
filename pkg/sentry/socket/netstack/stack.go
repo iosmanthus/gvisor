@@ -93,6 +93,20 @@ func (s *Stack) sendChangeEvent(ctx context.Context, id tcpip.NICID) {
 	}
 }
 
+// SetInterfaceMTU sets the MTU of the interface with index idx, as
+// SIOCSIFMTU does. A change sends RTM_NEWLINK, as a netlink change does.
+func (s *Stack) SetInterfaceMTU(ctx context.Context, idx int32, mtu uint32) *syserr.Error {
+	id := tcpip.NICID(idx)
+	if nicInfo, ok := s.Stack.SingleNICInfo(id); ok && nicInfo.MTU == mtu {
+		return nil
+	}
+	if err := s.Stack.SetNICMTU(id, mtu); err != nil {
+		return syserr.TranslateNetstackError(err)
+	}
+	s.sendChangeEvent(ctx, id)
+	return nil
+}
+
 func (s *Stack) sendDeleteEvent(ctx context.Context, id tcpip.NICID, nicInfo *stack.NICInfo) {
 	if s.eventSubscriber == nil {
 		return

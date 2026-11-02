@@ -284,6 +284,58 @@ INSTANTIATE_TEST_SUITE_P(Netlink, TuntapMTUTest,
                                            MTUParams{true, RTM_NEWLINK},
                                            MTUParams{true, RTM_SETLINK}));
 
+// SIOCSIFMTU changes the MTU with the same limits as netlink. wireguard-go
+// sets the MTU of its tun device this way.
+TEST_F(TuntapTest, SetMTUWithIoctl) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  FileDescriptor tun = ASSERT_NO_ERRNO_AND_VALUE(Open(kDevNetTun, O_RDWR));
+  struct ifreq ifr = {};
+  ifr.ifr_flags = IFF_TUN;
+  strncpy(ifr.ifr_name, kTunName, IFNAMSIZ);
+  ASSERT_THAT(ioctl(tun.get(), TUNSETIFF, &ifr), SyscallSucceeds());
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
+
+  for (const auto& test : {std::pair<int, int>{1330, 0},
+                           {68, 0},
+                           {67, EINVAL},
+                           {65535, 0},
+                           {65536, EINVAL},
+                           {-1, EINVAL}}) {
+    SCOPED_TRACE(test.first);
+    struct ifreq req = {};
+    strncpy(req.ifr_name, kTunName, IFNAMSIZ);
+    req.ifr_mtu = test.first;
+    if (test.second != 0) {
+      EXPECT_THAT(ioctl(sock.get(), SIOCSIFMTU, &req),
+                  SyscallFailsWithErrno(test.second));
+      continue;
+    }
+    ASSERT_THAT(ioctl(sock.get(), SIOCSIFMTU, &req), SyscallSucceeds());
+    struct ifreq got = {};
+    strncpy(got.ifr_name, kTunName, IFNAMSIZ);
+    ASSERT_THAT(ioctl(sock.get(), SIOCGIFMTU, &got), SyscallSucceeds());
+    EXPECT_EQ(got.ifr_mtu, test.first);
+    EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetLinkByName(kTunName)).mtu,
+              test.first);
+  }
+
+  struct ifreq req = {};
+  strncpy(req.ifr_name, "nosuchdev0", IFNAMSIZ);
+  req.ifr_mtu = 1500;
+  EXPECT_THAT(ioctl(sock.get(), SIOCSIFMTU, &req),
+              SyscallFailsWithErrno(ENODEV));
+
+  // The capability check comes before the device lookup.
+  AutoCapability cap(CAP_NET_ADMIN, false);
+  EXPECT_THAT(ioctl(sock.get(), SIOCSIFMTU, &req),
+              SyscallFailsWithErrno(EPERM));
+  strncpy(req.ifr_name, kTunName, IFNAMSIZ);
+  EXPECT_THAT(ioctl(sock.get(), SIOCSIFMTU, &req),
+              SyscallFailsWithErrno(EPERM));
+}
+
 TEST_F(TuntapTest, CreateInterfaceNoCap) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
