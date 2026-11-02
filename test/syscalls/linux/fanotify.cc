@@ -1386,6 +1386,40 @@ TEST(FanotifyPermTest, DenyGetdentsAndAio) {
   });
 }
 
+// O_PATH files give no events (Linux 6.5 and later), and reads through them
+// fail before the permission check.
+TEST(FanotifyPermTest, OPathFilesGiveNoEvents) {
+  SkipIfNoSysAdmin();
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(dir.path(), "abc", 0644));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(
+      g.get(), FAN_MARK_ADD,
+      FAN_OPEN | FAN_ACCESS | FAN_CLOSE | FAN_ONDIR | FAN_EVENT_ON_CHILD,
+      AT_FDCWD, dir.path().c_str()));
+  auto evs = EventsAfter(g.get(), [&] {
+    ASSERT_NO_ERRNO(Open(f.path(), O_PATH));
+    ASSERT_NO_ERRNO(Open(dir.path(), O_PATH | O_DIRECTORY));
+  });
+  EXPECT_TRUE(evs.empty()) << "mask " << evs[0].mask;
+  int n = PermEventsDuring(f.path(), FAN_ALLOW, [&] {
+    FileDescriptor p = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_PATH));
+    char c;
+    EXPECT_THAT(read(p.get(), &c, 1), SyscallFailsWithErrno(EBADF));
+  });
+  EXPECT_EQ(n, 0);
+  n = PermEventsDuring(dir.path(), FAN_ALLOW, [&] {
+    FileDescriptor p =
+        ASSERT_NO_ERRNO_AND_VALUE(Open(dir.path(), O_PATH | O_DIRECTORY));
+    char buf[256];
+    EXPECT_THAT(syscall(SYS_getdents64, p.get(), buf, sizeof(buf)),
+                SyscallFailsWithErrno(EBADF));
+  });
+  EXPECT_EQ(n, 0);
+}
+
 TEST(FanotifyPermTest, ExecReadsAreChecked) {
   SkipIfNoSysAdmin();
   // A copy of this test binary is a valid executable on every host.

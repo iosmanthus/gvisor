@@ -166,7 +166,9 @@ func (vfs *VirtualFilesystem) openOPathFD(ctx context.Context, creds *auth.Crede
 	}
 
 	fd := &opathFD{}
-	if err := fd.vfsfd.Init(fd, flags, creds, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{}); err != nil {
+	// O_PATH files give no inotify and no fanotify events (Linux 6.5 and
+	// later, fsnotify_file()).
+	if err := fd.vfsfd.Init(fd, flags, creds, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{NoNotify: true}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, err
