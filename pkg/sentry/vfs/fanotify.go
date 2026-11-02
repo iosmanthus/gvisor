@@ -173,8 +173,9 @@ type fanotifyMarks struct {
 	dead bool
 
 	// interest is the fast-path mask: the union of the interest of all
-	// marks. It is rebuilt on restore.
-	interest atomicbitops.Uint64 `state:"nosave"`
+	// marks. It is saved: with a zero mask after restore, no event would
+	// reach the marks.
+	interest atomicbitops.Uint64
 }
 
 // fanotifyInterest returns the bits of one mark that must reach the event

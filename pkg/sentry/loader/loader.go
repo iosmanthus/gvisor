@@ -313,6 +313,11 @@ type ImageInfo struct {
 	UserNamespace *auth.UserNamespace
 }
 
+// ErrExecRestart is returned by Load when a wait while it read the executable
+// (a fanotify permission event) was interrupted, for example by a checkpoint.
+// execve must then restart.
+var ErrExecRestart = syserr.NewDynamic("execve interrupted, must restart", errno.EINTR)
+
 // Load loads args.File into a MemoryManager. If args.File is nil, the path
 // args.Filename is resolved and loaded instead. Load also returns the new
 // credentials for the task after execve and a bool indicating whether the
@@ -329,6 +334,9 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	wds := wouldDumpState{userNS: auth.CredentialsFromContext(ctx).UserNamespace}
 	loaded, ac, file, newArgv, err := loadExecutable(ctx, args, &wds)
 	if err != nil {
+		if linuxerr.IsRestartError(err) {
+			return ImageInfo{}, nil, false, ErrExecRestart
+		}
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
 	defer file.DecRef(ctx)

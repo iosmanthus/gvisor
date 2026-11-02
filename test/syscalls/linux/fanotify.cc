@@ -54,6 +54,7 @@
 #include "test/util/fs_util.h"
 #include "test/util/mount_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/signal_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -408,6 +409,7 @@ TEST(FanotifyTest, InodeMarkSeesOnlyItsFile) {
   ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD,
                           FAN_OPEN | FAN_ACCESS | FAN_CLOSE_NOWRITE, AT_FDCWD,
                           a.path().c_str()));
+  MaybeSave();  // Marks and their interest masks survive restore.
   auto evs = EventsAfter(g.get(), [&] {
     char c;
     FileDescriptor fa = ASSERT_NO_ERRNO_AND_VALUE(Open(a.path(), O_RDONLY));
@@ -710,6 +712,7 @@ TEST(FanotifyTest, IgnoreMasks) {
   // An ignore-only inode mark on a suppresses the filesystem mark for a.
   ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_IGNORED_MASK,
                           FAN_ACCESS, AT_FDCWD, a.c_str()));
+  MaybeSave();  // Ignored masks survive restore.
   auto read1 = [](const std::string& p) {
     char c;
     FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(p, O_RDONLY));
@@ -825,6 +828,7 @@ TEST(FanotifyTest, PidOfExitedProcessAndOtherNamespace) {
   int status;
   ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
               SyscallSucceedsWithValue(child));
+  MaybeSave();  // A queued event survives restore.
   // The child is reaped; the event still has its PID.
   auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 1000));
   ASSERT_EQ(evs.size(), 1);
@@ -861,6 +865,7 @@ TEST(FanotifyTest, OverflowOnce) {
                           FAN_OPEN, AT_FDCWD, top.path().c_str()));
   // More events than the default queue holds, none of them mergeable.
   constexpr int kQueue = 16384;
+  DisableSave ds;  // Too many syscalls to save after each one.
   for (int i = 0; i < kQueue + 100; i++) {
     int fd = open(JoinPath(top.path(), absl::StrCat("f", i)).c_str(),
                   O_CREAT | O_RDONLY, 0644);
@@ -1099,6 +1104,7 @@ TEST(FanotifyPermTest, KilledWaiterThenCloseThenUmount) {
   ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
               SyscallSucceedsWithValue(child));
   EXPECT_TRUE(WIFSIGNALED(status));
+  MaybeSave();  // The canceled event survives restore.
   // The canceled event still consumes one answer.
   struct fanotify_response r = {.fd = evs[0].fd.get(), .response = FAN_ALLOW};
   EXPECT_THAT(write(g.get(), &r, sizeof(r)),
@@ -1136,6 +1142,12 @@ TEST(FanotifyPermTest, NonFatalSignalDoesNotStopWait) {
   absl::SleepFor(absl::Milliseconds(200));
   EXPECT_FALSE(done.load());  // Still waiting.
   Answer(g.get(), evs[0].fd.get(), FAN_ALLOW);
+  // After a save and restore the read restarts and sends a new event.
+  while (!done.load()) {
+    for (auto& e : ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 100))) {
+      Answer(g.get(), e.fd.get(), FAN_ALLOW);
+    }
+  }
   reader.Join();
   EXPECT_TRUE(done.load());
 }
@@ -1156,31 +1168,41 @@ TEST(FanotifyPermTest, ListenerReadsOwnEventFdUnderAccessPerm) {
   auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base));
   std::string f = JoinPath(dir.path(), "f");
   ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
-  FileDescriptor g =
-      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  // FAN_REPORT_TID tells the two reading threads apart.
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_CONTENT | FAN_REPORT_TID, O_RDONLY));
   ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
                           FAN_ACCESS_PERM, AT_FDCWD, dir.path().c_str()));
+  std::atomic<bool> done(false);
   ScopedThread reader([&] {
     FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f, O_RDONLY));
     char c;
     EXPECT_THAT(read(fd.get(), &c, 1), SyscallSucceedsWithValue(1));
+    done = true;
   });
   auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 5000));
   ASSERT_EQ(evs.size(), 1);
   // Read the event fd in another thread. If that read made an event, it
-  // would wait for us: we see the extra event here, answer it so nothing
-  // hangs, and fail.
+  // would wait for us: we see it here, answer it so nothing hangs, and
+  // fail.
+  std::atomic<pid_t> self_tid(0);
   ScopedThread self_reader([&] {
+    self_tid = gettid();
     char buf[3];
     EXPECT_THAT(pread(evs[0].fd.get(), buf, 3, 0), SyscallSucceedsWithValue(3));
   });
-  auto extra = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 500));
-  EXPECT_TRUE(extra.empty());
-  for (auto& e : extra) {
+  for (auto& e : ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 500))) {
+    EXPECT_NE(e.pid, self_tid.load());
     Answer(g.get(), e.fd.get(), FAN_ALLOW);
   }
   self_reader.Join();
   Answer(g.get(), evs[0].fd.get(), FAN_ALLOW);
+  // After a save and restore the read restarts and sends a new event.
+  while (!done.load()) {
+    for (auto& e : ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 100))) {
+      Answer(g.get(), e.fd.get(), FAN_ALLOW);
+    }
+  }
   reader.Join();
   // Remove the mark before the directory goes away.
   g.reset();
@@ -1406,6 +1428,66 @@ TEST(FanotifyTest, Fdinfo) {
   EXPECT_THAT(info, ::testing::ContainsRegex(
                         "fanotify ino:[0-9a-f]+ sdev:[0-9a-f]+ "
                         "mflags:0 mask:1 ignored_mask:0"));
+}
+
+TEST(FanotifyTest, EpollAfterRestore) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "x", 0644));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(
+      FanMark(g.get(), FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, f.path().c_str()));
+  for (uint32_t et : {0u, static_cast<uint32_t>(EPOLLET)}) {
+    SCOPED_TRACE(et ? "edge-triggered" : "level-triggered");
+    FileDescriptor ep = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+    ASSERT_NO_ERRNO(RegisterEpollFD(ep.get(), g.get(), EPOLLIN | et, 0));
+    MaybeSave();  // The queue is empty at save time.
+    for (int round = 0; round < 2; round++) {
+      Open(f.path(), O_RDONLY).IgnoreError();
+      struct epoll_event ev;
+      ASSERT_THAT(RetryEINTR(epoll_wait)(ep.get(), &ev, 1, 2000),
+                  SyscallSucceedsWithValue(1));
+      ASSERT_FALSE(ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 0)).empty());
+    }
+  }
+}
+
+TEST(FanotifyPermTest, ExecWaitSurvivesSave) {
+  SkipIfNoSysAdmin();
+  auto exe = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(),
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/exe")), 0755));
+  FileDescriptor g = ASSERT_NO_ERRNO_AND_VALUE(
+      FanInit(FAN_CLASS_CONTENT | FAN_NONBLOCK, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD,
+                          exe.path().c_str()));
+  pid_t c = fork();
+  if (c == 0) {
+    execl(exe.path().c_str(), "fanotify_test", "--gtest_list_tests", nullptr);
+    _exit(errno == EINTR ? 43 : 44);
+  }
+  // The child waits in exec for the first answer.
+  auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 5000));
+  ASSERT_FALSE(evs.empty());
+  // A checkpoint here interrupts the wait; the exec must restart.
+  MaybeSave();
+  for (auto& e : evs) {
+    Answer(g.get(), e.fd.get(), FAN_ALLOW);
+  }
+  // Answer every later event until the child exits.
+  int status = 0;
+  for (int i = 0; i < 500; i++) {
+    pid_t r = waitpid(c, &status, WNOHANG);
+    ASSERT_THAT(r, SyscallSucceeds());
+    if (r == c) {
+      break;
+    }
+    for (auto& e : ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 20))) {
+      Answer(g.get(), e.fd.get(), FAN_ALLOW);
+    }
+  }
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
 }
 
 }  // namespace

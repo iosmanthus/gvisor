@@ -114,7 +114,11 @@ func (g *Group) handlePermEvent(ctx context.Context, info *vfs.FanotifyEventInfo
 			ev.perm.state = permCanceled
 			g.queueMu.Unlock()
 		}
-		return linuxerr.ERESTARTSYS
+		// Linux can only end this wait for a fatal signal, so the caller
+		// never sees the error. gVisor also ends it for a stop (for example a
+		// checkpoint); the operation must then restart, also when a signal
+		// handler runs first.
+		return linuxerr.ERESTARTNOINTR
 	}
 	resp := ev.perm.response
 	g.queueMu.Unlock()

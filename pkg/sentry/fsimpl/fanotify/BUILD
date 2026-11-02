@@ -45,6 +45,7 @@ go_library(
         "origin.go",
         "perm.go",
         "queue.go",
+        "save_restore.go",
     ],
     importpath = "gvisor.dev/gvisor/pkg/sentry/fsimpl/fanotify",
     visibility = ["//pkg/sentry:internal"],

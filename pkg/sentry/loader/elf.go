@@ -447,7 +447,12 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescrip
 			if err != nil {
 				// If an interpreter was specified, it should exist.
 				ctx.Infof("Error reading PT_INTERP path: %v", err)
-				return loadedELF{}, linuxerr.ENOEXEC
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					return loadedELF{}, linuxerr.ENOEXEC
+				}
+				// Other errors (for example EPERM from a fanotify listener, or a
+				// restart error) pass through, as in Linux load_elf_binary().
+				return loadedELF{}, err
 			}
 
 			if path[len(path)-1] != 0 {

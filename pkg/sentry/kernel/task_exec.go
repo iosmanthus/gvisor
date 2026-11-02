@@ -191,6 +191,11 @@ func (r *runExecveAfterExecveCredsLock) execute(t *Task) taskRunState {
 	image, newCreds, secureExec, se := t.Kernel().LoadTaskImage(t, loadArgs)
 	if se != nil {
 		t.releaseExecveCredsLocks()
+		if se == loader.ErrExecRestart {
+			// A wait in the loader was interrupted (for example by a
+			// checkpoint); restart execve.
+			return t.doSyscallError(linuxerr.ERESTARTSYS)
+		}
 		return t.doSyscallError(se.ToError())
 	}
 
