@@ -710,6 +710,9 @@ func (fd *FileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 	if !fd.IsReadable() {
 		return 0, linuxerr.EBADF
 	}
+	if err := fd.CheckAccessPerm(ctx); err != nil {
+		return 0, err
+	}
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.PRead(ctx, dst, offset, opts)
 	if n > 0 {
@@ -724,6 +727,9 @@ func (fd *FileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error) {
 	if !fd.IsReadable() {
 		return 0, linuxerr.EBADF
+	}
+	if err := fd.CheckAccessPerm(ctx); err != nil {
+		return 0, err
 	}
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.Read(ctx, dst, opts)

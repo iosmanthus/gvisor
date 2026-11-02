@@ -218,22 +218,3 @@ func (g *Group) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // Stubs completed by later changes.
 
-// Permission event states.
-const (
-	permQueued = iota
-	permReported
-)
-
-// permState is the permission part of an event.
-//
-// +stateify savable
-type permState struct {
-	state int
-	fd    int32
-}
-
-func (g *Group) handlePermEvent(ctx context.Context, info *vfs.FanotifyEventInfo) error {
-	return nil
-}
-
-func (g *Group) finishPermEvent(ctx context.Context, ev *event, err error) {}

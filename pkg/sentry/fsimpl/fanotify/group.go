@@ -72,6 +72,12 @@ type Group struct {
 	// +checklocks:queueMu
 	events eventList
 
+	// access holds permission events that a reader returned and that have no
+	// answer yet, in the order they were read.
+	//
+	// +checklocks:queueMu
+	access eventList
+
 	// qlen is the length of events.
 	//
 	// +checklocks:queueMu
@@ -159,8 +165,20 @@ func (g *Group) Release(ctx context.Context) {
 	g.shutdown = true
 	for ev := g.events.Front(); ev != nil; ev = g.events.Front() {
 		g.events.Remove(ev)
-		if ev.vd.Ok() {
+		if ev.perm != nil {
+			// Linux fanotify_release() allows waiting operations. The
+			// waiter drops the reference.
+			g.answerLocked(ev, linux.FAN_ALLOW)
+		} else if ev.vd.Ok() {
 			drop = append(drop, ev.vd)
+		}
+	}
+	for ev := g.access.Front(); ev != nil; ev = g.access.Front() {
+		g.access.Remove(ev)
+		if ev.perm.state == permCanceled {
+			drop = append(drop, ev.vd)
+		} else {
+			g.answerLocked(ev, linux.FAN_ALLOW)
 		}
 	}
 	g.qlen = 0

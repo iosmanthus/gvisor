@@ -183,3 +183,19 @@ type FanotifyParentProvider interface {
 	// must not block and must not take group locks.
 	WithParentWatches(fn func(parent *Watches))
 }
+
+// CheckAccessPerm sends FAN_ACCESS_PERM for a read from fd (Linux
+// rw_verify_area()). It returns EPERM if a listener denies the read, or a
+// restart error if a fatal signal or a stop interrupted the wait.
+//
+// Preconditions: The caller holds no vfs, filesystem, or mark lock.
+func (fd *FileDescription) CheckAccessPerm(ctx context.Context) error {
+	if fd.opts.NoNotify {
+		return nil
+	}
+	vfs := fd.vd.mount.vfs
+	if vfs.fanotifyMarks.Load() == 0 {
+		return nil
+	}
+	return vfs.fanotifyPathEvent(ctx, fd.vd, fd.fileType(ctx), linux.FAN_ACCESS_PERM)
+}

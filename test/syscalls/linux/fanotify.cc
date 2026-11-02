@@ -26,6 +26,7 @@
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -38,6 +39,8 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/strings/str_cat.h"
 #include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
@@ -46,6 +49,7 @@
 #include "test/util/fs_util.h"
 #include "test/util/mount_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/signal_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -925,6 +929,9 @@ TEST(FanotifyTest, RootFilesystemEventsWithCopyUp) {
   });
   uint64_t all = 0;
   for (auto& e : evs) {
+    if (e.pid != getpid()) {
+      continue;  // The mark covers the whole filesystem.
+    }
     // Never a path of an overlay layer.
     EXPECT_EQ(e.path, f);
     all |= e.mask;
@@ -953,6 +960,258 @@ TEST(FanotifyTest, OverlayInodeMarkIsPerName) {
   } else {
     EXPECT_EQ(evs.size(), 1);
   }
+}
+
+// PermListener answers each FAN_ACCESS_PERM event of g with resp until stop
+// is set, and counts them in seen.
+void PermListener(int g, uint32_t resp, std::atomic<bool>* stop,
+                  std::atomic<int>* seen) {
+  while (!stop->load()) {
+    struct pollfd p = {.fd = g, .events = POLLIN};
+    if (poll(&p, 1, 100) <= 0) {
+      continue;
+    }
+    char buf[4096] __attribute__((aligned(8)));
+    ssize_t len = read(g, buf, sizeof(buf));
+    if (len <= 0) {
+      continue;
+    }
+    for (auto* m = reinterpret_cast<fanotify_event_metadata*>(buf);
+         FAN_EVENT_OK(m, len); m = FAN_EVENT_NEXT(m, len)) {
+      if (m->mask & FAN_ACCESS_PERM) {
+        struct fanotify_response r = {.fd = m->fd, .response = resp};
+        TEST_PCHECK(write(g, &r, sizeof(r)) == sizeof(r));
+        seen->fetch_add(1);
+      }
+      if (m->fd >= 0) {
+        close(m->fd);
+      }
+    }
+  }
+}
+
+void Answer(int g, int fd, uint32_t resp) {
+  struct fanotify_response r = {.fd = fd, .response = resp};
+  TEST_PCHECK(write(g, &r, sizeof(r)) == sizeof(r));
+}
+
+TEST(FanotifyPermTest, AllowDenyAndNoAccessEventOnDeny) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "abc", 0644));
+  for (uint32_t resp : {FAN_ALLOW, FAN_DENY}) {
+    SCOPED_TRACE(resp == FAN_ALLOW ? "allow" : "deny");
+    FileDescriptor g =
+        ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+    FileDescriptor gn = ASSERT_NO_ERRNO_AND_VALUE(
+        FanInit(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY));
+    ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD,
+                            f.path().c_str()));
+    ASSERT_NO_ERRNO(FanMark(gn.get(), FAN_MARK_ADD, FAN_ACCESS, AT_FDCWD,
+                            f.path().c_str()));
+    std::atomic<bool> stop(false);
+    std::atomic<int> seen(0);
+    ScopedThread listener([&] { PermListener(g.get(), resp, &stop, &seen); });
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    char buf[3];
+    if (resp == FAN_ALLOW) {
+      EXPECT_THAT(read(fd.get(), buf, 3), SyscallSucceedsWithValue(3));
+      EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(gn.get(), 1000)).size(),
+                1);
+    } else {
+      EXPECT_THAT(read(fd.get(), buf, 3), SyscallFailsWithErrno(EPERM));
+      // A denied read gives no FAN_ACCESS.
+      EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(gn.get(), 300)).empty());
+    }
+    stop = true;
+    listener.Join();
+    EXPECT_EQ(seen.load(), 1);
+  }
+}
+
+TEST(FanotifyPermTest, ResponseErrors) {
+  SkipIfNoSysAdmin();
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  struct fanotify_response r = {.fd = 5, .response = FAN_ALLOW};
+  EXPECT_THAT(write(g.get(), &r, 4), SyscallFailsWithErrno(EINVAL));
+  r.response = 7;
+  EXPECT_THAT(write(g.get(), &r, sizeof(r)), SyscallFailsWithErrno(EINVAL));
+  r = {.fd = -1, .response = FAN_ALLOW};
+  EXPECT_THAT(write(g.get(), &r, sizeof(r)), SyscallFailsWithErrno(EINVAL));
+  r = {.fd = 1000, .response = FAN_ALLOW};
+  EXPECT_THAT(write(g.get(), &r, sizeof(r)), SyscallFailsWithErrno(ENOENT));
+}
+
+TEST(FanotifyPermTest, CloseAllowsWaitersAndReleasesReferences) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string f = JoinPath(top.path(), "f");
+  ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT,
+                          FAN_ACCESS_PERM, AT_FDCWD, top.path().c_str()));
+  // One reader waits after the listener read its event; then the group
+  // closes without an answer.
+  ScopedThread reader([&] {
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f, O_RDONLY));
+    char c;
+    EXPECT_THAT(read(fd.get(), &c, 1), SyscallSucceedsWithValue(1));
+  });
+  auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 5000));
+  ASSERT_EQ(evs.size(), 1);
+  evs.clear();
+  g.reset();  // Closing the group allows the waiting read.
+  reader.Join();
+  // No reference is left: a normal unmount succeeds.
+  ASSERT_THAT(umount(top.path().c_str()), SyscallSucceeds());
+  m.Release();
+}
+
+TEST(FanotifyPermTest, KilledWaiterThenCloseThenUmount) {
+  SkipIfNoSysAdmin();
+  auto top = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto m = ASSERT_NO_ERRNO_AND_VALUE(Mount("", top.path(), "tmpfs", 0, "", 0));
+  std::string f = JoinPath(top.path(), "f");
+  ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT,
+                          FAN_ACCESS_PERM, AT_FDCWD, top.path().c_str()));
+  pid_t child = fork();
+  if (child == 0) {
+    int fd = open(f.c_str(), O_RDONLY);
+    char c;
+    (void)!read(fd, &c, 1);  // Waits for an answer.
+    _exit(0);
+  }
+  auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 5000));
+  ASSERT_EQ(evs.size(), 1);
+  ASSERT_THAT(kill(child, SIGKILL), SyscallSucceeds());
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFSIGNALED(status));
+  // The canceled event still consumes one answer.
+  struct fanotify_response r = {.fd = evs[0].fd.get(), .response = FAN_ALLOW};
+  EXPECT_THAT(write(g.get(), &r, sizeof(r)),
+              SyscallSucceedsWithValue(sizeof(r)));
+  EXPECT_THAT(write(g.get(), &r, sizeof(r)), SyscallFailsWithErrno(ENOENT));
+  evs.clear();
+  g.reset();
+  ASSERT_THAT(umount(top.path().c_str()), SyscallSucceeds());
+  m.Release();
+}
+
+TEST(FanotifyPermTest, NonFatalSignalDoesNotStopWait) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "abc", 0644));
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD,
+                          f.path().c_str()));
+  struct sigaction sa = {};
+  sa.sa_handler = +[](int) {};
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGUSR1, sa));
+  std::atomic<pid_t> tid(0);
+  std::atomic<bool> done(false);
+  ScopedThread reader([&] {
+    tid = gettid();
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    char c;
+    EXPECT_THAT(read(fd.get(), &c, 1), SyscallSucceedsWithValue(1));
+    done = true;
+  });
+  auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 5000));
+  ASSERT_EQ(evs.size(), 1);
+  ASSERT_THAT(tgkill(getpid(), tid.load(), SIGUSR1), SyscallSucceeds());
+  absl::SleepFor(absl::Milliseconds(200));
+  EXPECT_FALSE(done.load());  // Still waiting.
+  Answer(g.get(), evs[0].fd.get(), FAN_ALLOW);
+  reader.Join();
+  EXPECT_TRUE(done.load());
+}
+
+TEST(FanotifyPermTest, ListenerReadsOwnEventFdUnderAccessPerm) {
+  SkipIfNoSysAdmin();
+  // On gVisor use the sandbox root (overlay in the default configuration);
+  // on Linux a separate tmpfs, so that the mark does not stop the host.
+  std::string base = GetAbsoluteTestTmpdir();
+  Cleanup unmount;
+  TempPath mnt;
+  if (!IsRunningOnGvisor()) {
+    mnt = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+    unmount = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount("", mnt.path(), "tmpfs", 0, "", 0));
+    base = mnt.path();
+  }
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base));
+  std::string f = JoinPath(dir.path(), "f");
+  ASSERT_NO_ERRNO(CreateWithContents(f, "abc"));
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_ACCESS_PERM, AT_FDCWD, dir.path().c_str()));
+  ScopedThread reader([&] {
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f, O_RDONLY));
+    char c;
+    EXPECT_THAT(read(fd.get(), &c, 1), SyscallSucceedsWithValue(1));
+  });
+  auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 5000));
+  ASSERT_EQ(evs.size(), 1);
+  // Read the event fd in another thread. If that read made an event, it
+  // would wait for us: we see the extra event here, answer it so nothing
+  // hangs, and fail.
+  ScopedThread self_reader([&] {
+    char buf[3];
+    EXPECT_THAT(pread(evs[0].fd.get(), buf, 3, 0), SyscallSucceedsWithValue(3));
+  });
+  auto extra = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 500));
+  EXPECT_TRUE(extra.empty());
+  for (auto& e : extra) {
+    Answer(g.get(), e.fd.get(), FAN_ALLOW);
+  }
+  self_reader.Join();
+  Answer(g.get(), evs[0].fd.get(), FAN_ALLOW);
+  reader.Join();
+  // Remove the mark before the directory goes away.
+  g.reset();
+}
+
+TEST(FanotifyPermTest, LargeBufferReturnsAtOnce) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "abc", 0644));
+  FileDescriptor g =  // Blocking.
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  ASSERT_NO_ERRNO(FanMark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM, AT_FDCWD,
+                          f.path().c_str()));
+  ScopedThread reader([&] {
+    FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    char c;
+    EXPECT_THAT(read(fd.get(), &c, 1), SyscallSucceedsWithValue(1));
+  });
+  // A blocking read with room for many events returns the one event; it
+  // does not wait for more.
+  std::vector<char> buf(64 * 1024);
+  ssize_t len = read(g.get(), buf.data(), buf.size());
+  ASSERT_EQ(len, sizeof(fanotify_event_metadata));
+  auto* md = reinterpret_cast<fanotify_event_metadata*>(buf.data());
+  Answer(g.get(), md->fd, FAN_ALLOW);
+  close(md->fd);
+  reader.Join();
+}
+
+TEST(FanotifyPermTest, ProcfsPermMarkRejected) {
+  SkipIfNoSysAdmin();
+  FileDescriptor g =
+      ASSERT_NO_ERRNO_AND_VALUE(FanInit(FAN_CLASS_CONTENT, O_RDONLY));
+  EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT,
+                            FAN_ACCESS_PERM, AT_FDCWD, "/proc"),
+              SyscallFailsWithErrno(EINVAL));
 }
 
 }  // namespace

@@ -43,6 +43,7 @@ go_library(
         "marks.go",
         "merge.go",
         "origin.go",
+        "perm.go",
         "queue.go",
     ],
     importpath = "gvisor.dev/gvisor/pkg/sentry/fsimpl/fanotify",
