@@ -564,7 +564,9 @@ func (fs *Filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 			fs.mu.RUnlock()
 			return nil, err
 		}
-		if err := d.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil && !opts.SkipDACCheck {
+		// opts.SkipDACCheck is ignored: kernfs inodes also check more than
+		// DAC in CheckPermissions (for example, procfs capability checks).
+		if err := d.inode.CheckPermissions(ctx, rp.Credentials(), ats); err != nil {
 			fs.mu.RUnlock()
 			return nil, err
 		}

@@ -58,6 +58,7 @@
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/mount_util.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/signal_util.h"
@@ -353,6 +354,31 @@ TEST(FanotifyTest, InternalObjectsAndProc) {
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_REMOVE, FAN_ACCESS_PERM, AT_FDCWD,
                             "/proc/self/status"),
               SyscallSucceeds());
+}
+
+// On gVisor, the event fd of a procfs file keeps the open checks of procfs:
+// without CAP_SYS_RESOURCE, user.max_user_namespaces is read-only.
+TEST(FanotifyTest, EventFdKeepsProcfsOpenChecks) {
+  SKIP_IF(!IsRunningOnGvisor());
+  SkipIfNoSysAdmin();
+  constexpr char kPath[] = "/proc/sys/user/max_user_namespaces";
+  EXPECT_THAT(InForkedProcess([&] {
+                TEST_CHECK_NO_ERRNO(SetCapability(CAP_SYS_RESOURCE, false));
+                TEST_PCHECK(open(kPath, O_WRONLY) < 0 && errno == EACCES);
+                int g = fanotify_init(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_WRONLY);
+                TEST_PCHECK(g >= 0);
+                TEST_PCHECK(fanotify_mark(g, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD,
+                                          kPath) == 0);
+                int fd = open(kPath, O_RDONLY);
+                TEST_PCHECK(fd >= 0);
+                close(fd);
+                // The event fd would be writable, so the read fails.
+                char buf[4096] __attribute__((aligned(8)));
+                ssize_t n = read(g, buf, sizeof(buf));
+                TEST_CHECK_MSG(n < 0 && errno == EACCES,
+                               "read of the event did not fail with EACCES");
+              }),
+              IsPosixErrorOkAndHolds(0));
 }
 
 TEST(FanotifyTest, MarksDoNotKeepMountBusy) {

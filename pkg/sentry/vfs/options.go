@@ -150,7 +150,8 @@ type OpenOptions struct {
 	NoNotify bool
 
 	// SkipDACCheck skips the DAC part of the open permission check, as Linux
-	// dentry_open() does for fanotify event files. Only sentry code sets it.
+	// dentry_open() does for fanotify event files. kernfs ignores it. Only
+	// sentry code sets it.
 	SkipDACCheck bool
 }
 
