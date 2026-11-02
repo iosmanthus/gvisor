@@ -80,7 +80,7 @@ func Readv(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		return 0, nil, err
 	}
 
-	n, err := read(t, file, dst, vfs.ReadOptions{})
+	n, err := read(t, file, dst, vfs.ReadOptions{Vector: true})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, HandleIOError(t, n != 0, err, linuxerr.ERESTARTSYS, "readv", file)
 }
@@ -90,6 +90,8 @@ func read(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opt
 	if !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		return n, err
 	}
+	// Retries are part of the same read: FAN_ACCESS_PERM was sent once.
+	opts.FanotifyChecked = true
 
 	allowBlock, deadline, hasDeadline := blockPolicy(t, file)
 	if !allowBlock {
@@ -187,7 +189,7 @@ func Preadv(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 		return 0, nil, err
 	}
 
-	n, err := pread(t, file, dst, offset, vfs.ReadOptions{})
+	n, err := pread(t, file, dst, offset, vfs.ReadOptions{Vector: true})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, HandleIOError(t, n != 0, err, linuxerr.ERESTARTSYS, "preadv", file)
 }
@@ -225,6 +227,7 @@ func Preadv2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 
 	opts := vfs.ReadOptions{
 		Flags: uint32(flags),
+		Vector: true,
 	}
 	var n int64
 	if offset == -1 {
@@ -241,6 +244,8 @@ func pread(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, of
 	if !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		return n, err
 	}
+	// Retries are part of the same read: FAN_ACCESS_PERM was sent once.
+	opts.FanotifyChecked = true
 
 	allowBlock, deadline, hasDeadline := blockPolicy(t, file)
 	if !allowBlock {

@@ -710,12 +710,12 @@ func (fd *FileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 	if !fd.IsReadable() {
 		return 0, linuxerr.EBADF
 	}
-	if err := fd.CheckAccessPerm(ctx); err != nil {
+	if err := fd.checkReadPerm(ctx, dst, opts); err != nil {
 		return 0, err
 	}
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.PRead(ctx, dst, offset, opts)
-	if n > 0 {
+	if n > 0 || (opts.Vector && err == nil) {
 		fd.notify(ctx, linux.IN_ACCESS, linux.FAN_ACCESS)
 	}
 	fsmetric.Reads.Increment()
@@ -728,12 +728,12 @@ func (fd *FileDescription) Read(ctx context.Context, dst usermem.IOSequence, opt
 	if !fd.IsReadable() {
 		return 0, linuxerr.EBADF
 	}
-	if err := fd.CheckAccessPerm(ctx); err != nil {
+	if err := fd.checkReadPerm(ctx, dst, opts); err != nil {
 		return 0, err
 	}
 	start := fsmetric.StartReadWait()
 	n, err := fd.impl.Read(ctx, dst, opts)
-	if n > 0 {
+	if n > 0 || (opts.Vector && err == nil) {
 		fd.notify(ctx, linux.IN_ACCESS, linux.FAN_ACCESS)
 	}
 	fsmetric.Reads.Increment()
@@ -774,6 +774,13 @@ func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, op
 // IterDirents has been called since the last call to Seek, it continues
 // iteration from the end of the last call.
 func (fd *FileDescription) IterDirents(ctx context.Context, cb IterDirentsCallback) error {
+	// Linux iterate_dir() returns ENOTDIR before the permission check, and a
+	// denied read gives no FAN_ACCESS.
+	if fd.vd.mount.vfs.fanotifyMarks.Load() != 0 && fd.fileType(ctx) == linux.S_IFDIR {
+		if err := fd.CheckAccessPerm(ctx); err != nil {
+			return err
+		}
+	}
 	defer fd.notify(ctx, linux.IN_ACCESS, linux.FAN_ACCESS)
 	return fd.impl.IterDirents(ctx, cb)
 }

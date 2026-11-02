@@ -125,6 +125,13 @@ func Splice(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 		n   int64
 		err error
 	)
+	// Check the read once, before the destination pipe lock (Linux
+	// rw_verify_area() in do_splice()).
+	if !inIsPipe {
+		if err := inFile.CheckAccessPerm(t); err != nil {
+			return 0, nil, err
+		}
+	}
 	dw := dualWaiter{
 		inFile:  inFile,
 		outFile: outFile,
@@ -353,6 +360,10 @@ func Sendfile(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 		total int64
 		err   error
 	)
+	// Check the read once for the whole copy (Linux do_sendfile()).
+	if err := inFile.CheckAccessPerm(t); err != nil {
+		return 0, nil, err
+	}
 	dw := dualWaiter{
 		inFile:  inFile,
 		outFile: outFile,
@@ -399,10 +410,10 @@ func Sendfile(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 			buf := (*bufPtr)[:bufLen]
 			var readN int64
 			if offset != -1 {
-				readN, err = inFile.PRead(t, usermem.BytesIOSequence(buf), offset, vfs.ReadOptions{})
+				readN, err = inFile.PRead(t, usermem.BytesIOSequence(buf), offset, vfs.ReadOptions{FanotifyChecked: true})
 				offset += readN
 			} else {
-				readN, err = inFile.Read(t, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+				readN, err = inFile.Read(t, usermem.BytesIOSequence(buf), vfs.ReadOptions{FanotifyChecked: true})
 			}
 
 			// Write all of the bytes that we read. This may need
@@ -622,6 +633,11 @@ func CopyFileRange(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (u
 	}
 	limit := int64(count)
 
+	// Check the read once for the whole copy (Linux vfs_copy_file_range()).
+	if err := inFile.CheckAccessPerm(t); err != nil {
+		return 0, nil, err
+	}
+
 	// Regular files do not block; no dualWaiter needed.
 	var (
 		total  int64
@@ -633,9 +649,9 @@ func CopyFileRange(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (u
 
 		var readN int64
 		if haveInOffset {
-			readN, cprErr = inFile.PRead(t, usermem.BytesIOSequence(buf), inOffset, vfs.ReadOptions{})
+			readN, cprErr = inFile.PRead(t, usermem.BytesIOSequence(buf), inOffset, vfs.ReadOptions{FanotifyChecked: true})
 		} else {
-			readN, cprErr = inFile.Read(t, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+			readN, cprErr = inFile.Read(t, usermem.BytesIOSequence(buf), vfs.ReadOptions{FanotifyChecked: true})
 		}
 		if readN == 0 {
 			// EOF or no progress.

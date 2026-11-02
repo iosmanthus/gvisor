@@ -313,6 +313,15 @@ func submitCallback(t *kernel.Task, id uint64, cb *linux.IOCallback, cbAddr host
 	if !ok {
 		return linuxerr.EINVAL
 	}
+	// Linux aio_read() checks the read when it submits the request. The
+	// callback runs on another goroutine, which cannot wait for a fanotify
+	// listener, so check here, on the task goroutine.
+	switch cb.OpCode {
+	case linux.IOCB_CMD_PREAD, linux.IOCB_CMD_PREADV:
+		if err := fd.CheckAccessPerm(t); err != nil {
+			return err
+		}
+	}
 	if err := aioCtx.Prepare(); err != nil {
 		return err
 	}
@@ -351,7 +360,7 @@ func getAIOCallback(t *kernel.Task, fd, eventFD *vfs.FileDescription, cbAddr hos
 		var err error
 		switch cb.OpCode {
 		case linux.IOCB_CMD_PREAD, linux.IOCB_CMD_PREADV:
-			ev.Result, err = fd.PRead(ctx, ioseq, cb.Offset, vfs.ReadOptions{})
+			ev.Result, err = fd.PRead(ctx, ioseq, cb.Offset, vfs.ReadOptions{FanotifyChecked: true})
 		case linux.IOCB_CMD_PWRITE, linux.IOCB_CMD_PWRITEV:
 			ev.Result, err = fd.PWrite(ctx, ioseq, cb.Offset, vfs.WriteOptions{})
 		case linux.IOCB_CMD_FSYNC, linux.IOCB_CMD_FDSYNC:

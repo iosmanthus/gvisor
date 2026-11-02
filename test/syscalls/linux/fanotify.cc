@@ -22,12 +22,17 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
+
+// After sys/mount.h: linux/aio_abi.h includes linux/fs.h.
+#include <linux/aio_abi.h>
 
 #include <atomic>
 #include <cerrno>
@@ -1212,6 +1217,166 @@ TEST(FanotifyPermTest, ProcfsPermMarkRejected) {
   EXPECT_THAT(fanotify_mark(g.get(), FAN_MARK_ADD | FAN_MARK_MOUNT,
                             FAN_ACCESS_PERM, AT_FDCWD, "/proc"),
               SyscallFailsWithErrno(EINVAL));
+}
+
+// PermEventsDuring marks path with FAN_ACCESS_PERM, runs fn while a listener
+// answers resp, and returns the number of permission events, or -1 on a
+// setup error.
+int PermEventsDuring(const std::string& path, uint32_t resp,
+                     const std::function<void()>& fn) {
+  auto g_or = FanInit(FAN_CLASS_CONTENT, O_RDONLY);
+  if (!g_or.ok()) {
+    return -1;
+  }
+  FileDescriptor g = std::move(g_or).ValueOrDie();
+  if (fanotify_mark(g.get(), FAN_MARK_ADD, FAN_ACCESS_PERM | FAN_ONDIR,
+                    AT_FDCWD, path.c_str()) != 0) {
+    return -1;
+  }
+  std::atomic<bool> stop(false);
+  std::atomic<int> seen(0);
+  ScopedThread listener([&] { PermListener(g.get(), resp, &stop, &seen); });
+  fn();
+  // Let the listener see late events before it stops.
+  absl::SleepFor(absl::Milliseconds(200));
+  stop = true;
+  listener.Join();
+  return seen.load();
+}
+
+TEST(FanotifyPermTest, OneEventPerOperation) {
+  SkipIfNoSysAdmin();
+  // Linux 6.8 checks sendfile and copy_file_range once; Linux 6.6 checks
+  // each internal chunk. gVisor follows 6.8.
+  auto once = [](int n) { return IsRunningOnGvisor() ? n == 1 : n >= 1; };
+  // Bigger than the internal buffers of sendfile and copy_file_range.
+  const std::string big(256 * 1024, 'x');
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), big, 0644));
+  auto out = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+
+  int n = PermEventsDuring(f.path(), FAN_ALLOW, [&] {
+    FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    FileDescriptor o = ASSERT_NO_ERRNO_AND_VALUE(Open(out.path(), O_WRONLY));
+    EXPECT_THAT(sendfile(o.get(), in.get(), nullptr, big.size()),
+                SyscallSucceedsWithValue(big.size()));
+  });
+  EXPECT_TRUE(once(n)) << "sendfile: " << n;
+
+  n = PermEventsDuring(f.path(), FAN_ALLOW, [&] {
+    FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    FileDescriptor o = ASSERT_NO_ERRNO_AND_VALUE(Open(out.path(), O_WRONLY));
+    EXPECT_THAT(syscall(SYS_copy_file_range, in.get(), nullptr, o.get(),
+                        nullptr, big.size(), 0),
+                SyscallSucceedsWithValue(big.size()));
+  });
+  EXPECT_TRUE(once(n)) << "copy_file_range: " << n;
+
+  n = PermEventsDuring(f.path(), FAN_ALLOW, [&] {
+    FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    int p[2];
+    ASSERT_THAT(pipe(p), SyscallSucceeds());
+    FileDescriptor r(p[0]);
+    FileDescriptor w(p[1]);
+    EXPECT_THAT(splice(in.get(), nullptr, w.get(), nullptr, 4096, 0),
+                SyscallSucceedsWithValue(4096));
+  });
+  EXPECT_EQ(n, 1) << "splice";
+
+  // A zero-length read is checked; a zero-length vector is not.
+  n = PermEventsDuring(f.path(), FAN_ALLOW, [&] {
+    FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    char c;
+    EXPECT_THAT(read(in.get(), &c, 0), SyscallSucceedsWithValue(0));
+  });
+  EXPECT_EQ(n, 1) << "read of 0 bytes";
+
+  n = PermEventsDuring(f.path(), FAN_ALLOW, [&] {
+    FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    struct iovec iov = {nullptr, 0};
+    EXPECT_THAT(readv(in.get(), &iov, 1), SyscallSucceedsWithValue(0));
+  });
+  EXPECT_EQ(n, 0) << "readv of 0 bytes";
+
+  // Validation comes first: no event for a write-only fd.
+  n = PermEventsDuring(f.path(), FAN_ALLOW, [&] {
+    FileDescriptor wo = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_WRONLY));
+    char c;
+    EXPECT_THAT(read(wo.get(), &c, 1), SyscallFailsWithErrno(EBADF));
+  });
+  EXPECT_EQ(n, 0) << "read of a write-only fd";
+}
+
+TEST(FanotifyPermTest, DenyEveryReadPath) {
+  SkipIfNoSysAdmin();
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "abcdef", 0644));
+  auto out = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  PermEventsDuring(f.path(), FAN_DENY, [&] {
+    FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    FileDescriptor o = ASSERT_NO_ERRNO_AND_VALUE(Open(out.path(), O_WRONLY));
+    char buf[6];
+    struct iovec iov = {buf, sizeof(buf)};
+    EXPECT_THAT(read(in.get(), buf, 6), SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(pread(in.get(), buf, 6, 0), SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(readv(in.get(), &iov, 1), SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(preadv2(in.get(), &iov, 1, 0, 0), SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(sendfile(o.get(), in.get(), nullptr, 6),
+                SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(syscall(SYS_copy_file_range, in.get(), nullptr, o.get(),
+                        nullptr, 6, 0),
+                SyscallFailsWithErrno(EPERM));
+  });
+}
+
+TEST(FanotifyPermTest, DenyGetdentsAndAio) {
+  SkipIfNoSysAdmin();
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(dir.path(), "abcdef", 0644));
+  PermEventsDuring(dir.path(), FAN_DENY, [&] {
+    FileDescriptor d = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(dir.path(), O_RDONLY | O_DIRECTORY));
+    char buf[256];
+    EXPECT_THAT(syscall(SYS_getdents64, d.get(), buf, sizeof(buf)),
+                SyscallFailsWithErrno(EPERM));
+  });
+  PermEventsDuring(f.path(), FAN_DENY, [&] {
+    // AIO checks the read when io_submit queues it.
+    aio_context_t ctx = 0;
+    ASSERT_THAT(syscall(SYS_io_setup, 1, &ctx), SyscallSucceeds());
+    FileDescriptor in = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+    char buf[6];
+    struct iocb cb = {};
+    cb.aio_fildes = in.get();
+    cb.aio_lio_opcode = IOCB_CMD_PREAD;
+    cb.aio_buf = reinterpret_cast<uint64_t>(buf);
+    cb.aio_nbytes = sizeof(buf);
+    struct iocb* cbs[1] = {&cb};
+    EXPECT_THAT(syscall(SYS_io_submit, ctx, 1, cbs),
+                SyscallFailsWithErrno(EPERM));
+    syscall(SYS_io_destroy, ctx);
+  });
+}
+
+TEST(FanotifyPermTest, ExecReadsAreChecked) {
+  SkipIfNoSysAdmin();
+  // A copy of this test binary is a valid executable on every host.
+  auto exe = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(),
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/exe")), 0755));
+  int n = PermEventsDuring(exe.path(), FAN_DENY, [&] {
+    pid_t c = fork();
+    if (c == 0) {
+      execl(exe.path().c_str(), "fanotify_test", "--gtest_list_tests",
+            nullptr);
+      _exit(errno == EPERM ? 42 : 43);
+    }
+    int status;
+    ASSERT_THAT(RetryEINTR(waitpid)(c, &status, 0), SyscallSucceeds());
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 42) << status;
+  });
+  EXPECT_GE(n, 1);
 }
 
 }  // namespace

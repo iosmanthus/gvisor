@@ -162,6 +162,16 @@ type OpenOptions struct {
 type ReadOptions struct {
 	// Flags contains flags as specified for preadv2(2).
 	Flags uint32
+
+	// FanotifyChecked is set by sentry code that already sent
+	// FAN_ACCESS_PERM for this operation (sendfile, splice, copy_file_range,
+	// AIO, retries of one read). No application flag maps to it.
+	FanotifyChecked bool
+
+	// Vector is set for readv(2), preadv(2), and preadv2(2). As in Linux
+	// do_readv(), a zero-length vector gets no FAN_ACCESS_PERM, and a
+	// zero-byte result still gives FAN_ACCESS.
+	Vector bool
 }
 
 // RenameOptions contains options to VirtualFilesystem.RenameAt() and

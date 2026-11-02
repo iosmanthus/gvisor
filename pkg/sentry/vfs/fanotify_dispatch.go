@@ -19,6 +19,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Roles of a mark in one event.
@@ -198,4 +199,14 @@ func (fd *FileDescription) CheckAccessPerm(ctx context.Context) error {
 		return nil
 	}
 	return vfs.fanotifyPathEvent(ctx, fd.vd, fd.fileType(ctx), linux.FAN_ACCESS_PERM)
+}
+
+// checkReadPerm is CheckAccessPerm for Read and PRead: it does nothing if the
+// caller already checked this operation, and nothing for a zero-length vector
+// (Linux do_readv()).
+func (fd *FileDescription) checkReadPerm(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) error {
+	if opts.FanotifyChecked || (opts.Vector && dst.NumBytes() == 0) {
+		return nil
+	}
+	return fd.CheckAccessPerm(ctx)
 }

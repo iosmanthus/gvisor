@@ -317,6 +317,8 @@ func (fd *VFSPipeFD) SpliceToNonPipe(ctx context.Context, out *vfs.FileDescripti
 }
 
 // SpliceFromNonPipe performs a splice operation from a non-pipe file to fd.
+// The caller must have sent FAN_ACCESS_PERM for in
+// (vfs.FileDescription.CheckAccessPerm); the reads here do not send it again.
 func (fd *VFSPipeFD) SpliceFromNonPipe(ctx context.Context, in *vfs.FileDescription, off, count int64) (int64, error) {
 	dst := usermem.IOSequence{
 		IO:    fd,
@@ -330,9 +332,9 @@ func (fd *VFSPipeFD) SpliceFromNonPipe(ctx context.Context, in *vfs.FileDescript
 	fd.pipe.mu.Lock()
 	fd.lastAddr = 0
 	if off == -1 {
-		n, err = in.Read(ctx, dst, vfs.ReadOptions{})
+		n, err = in.Read(ctx, dst, vfs.ReadOptions{FanotifyChecked: true})
 	} else {
-		n, err = in.PRead(ctx, dst, off, vfs.ReadOptions{})
+		n, err = in.PRead(ctx, dst, off, vfs.ReadOptions{FanotifyChecked: true})
 	}
 	fd.pipe.mu.Unlock()
 
