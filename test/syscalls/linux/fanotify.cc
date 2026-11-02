@@ -1528,13 +1528,20 @@ TEST(FanotifyPermTest, ExecWaitSurvivesSave) {
                           exe.path().c_str()));
   pid_t c = fork();
   if (c == 0) {
+    // A handler without SA_RESTART. Exec resets it to SIG_DFL (ignore).
+    struct sigaction sa = {};
+    sa.sa_handler = +[](int) {};
+    sigaction(SIGWINCH, &sa, nullptr);
     execl(exe.path().c_str(), "fanotify_test", "--gtest_list_tests", nullptr);
     _exit(errno == EINTR ? 43 : 44);
   }
   // The child waits in exec for the first answer.
   auto evs = ASSERT_NO_ERRNO_AND_VALUE(ReadEvents(g.get(), 5000));
   ASSERT_FALSE(evs.empty());
-  // A checkpoint here interrupts the wait; the exec must restart.
+  // A signal does not end the wait; it stays pending.
+  ASSERT_THAT(kill(c, SIGWINCH), SyscallSucceeds());
+  // A checkpoint here interrupts the wait; the exec must restart, also with
+  // the pending signal.
   MaybeSave();
   for (auto& e : evs) {
     Answer(g.get(), e.fd.get(), FAN_ALLOW);

@@ -193,8 +193,9 @@ func (r *runExecveAfterExecveCredsLock) execute(t *Task) taskRunState {
 		t.releaseExecveCredsLocks()
 		if se == loader.ErrExecRestart {
 			// A wait in the loader was interrupted (for example by a
-			// checkpoint); restart execve.
-			return t.doSyscallError(linuxerr.ERESTARTSYS)
+			// checkpoint); restart execve, also if a signal handler runs
+			// first.
+			return t.doSyscallError(linuxerr.ERESTARTNOINTR)
 		}
 		return t.doSyscallError(se.ToError())
 	}
