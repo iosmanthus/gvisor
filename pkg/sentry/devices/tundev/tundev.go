@@ -17,6 +17,7 @@ package tundev
 
 import (
 	"io"
+	"math"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -32,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -40,6 +42,13 @@ import (
 const (
 	netTunDevMajor = 10
 	netTunDevMinor = 200
+
+	// maxWriteSize is the size of the largest packet that one write can
+	// inject: the largest IPv6 packet without a jumbo payload option, with
+	// the packet information header and an Ethernet header. Packets larger
+	// than the interface MTU are accepted, as on Linux: the MTU limits only
+	// what the interface sends.
+	maxWriteSize = header.IPv6FixedHeaderSize + math.MaxUint16 + tun.PacketInfoHeaderSize + header.EthernetMinimumSize
 )
 
 var warnRateLimiter = rate.NewLimiter(rate.Every(time.Second), 1)
@@ -161,11 +170,9 @@ func (fd *tunFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.Wri
 	if src.NumBytes() == 0 {
 		return 0, unix.EINVAL
 	}
-	mtu, err := fd.device.MTU()
-	if err != nil {
-		return 0, err
-	}
-	if int64(mtu) < src.NumBytes() {
+	// Linux takes larger writes and drops them; fail them instead of
+	// allocating for a packet that cannot be valid.
+	if src.NumBytes() > maxWriteSize {
 		return 0, unix.EMSGSIZE
 	}
 	data := buffer.NewView(int(src.NumBytes()))
