@@ -1806,6 +1806,20 @@ func (s *Stack) findRouteWithLocalAddrFromAnyInterfaceRLocked(outgoingNIC *nic, 
 // remote address is provided, the stack will use a remote address equal to the
 // local address.
 func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool) (*Route, tcpip.Error) {
+	// Locally generated packets come from "lo" for policy rules, as in Linux.
+	return s.findRoute(id, localAddr, remoteAddr, netProto, multicastLoop, 0 /* inNIC */, localAddr)
+}
+
+// FindRouteForForwarding is FindRoute for a packet that arrived on inNIC from
+// src and is forwarded to dst. Policy rules see the input interface and the
+// source.
+func (s *Stack) FindRouteForForwarding(inNIC tcpip.NICID, src, dst tcpip.Address, netProto tcpip.NetworkProtocolNumber) (*Route, tcpip.Error) {
+	return s.findRoute(0 /* id */, tcpip.Address{}, dst, netProto, false /* multicastLoop */, inNIC, src)
+}
+
+// findRoute implements FindRoute and FindRouteForForwarding. inNIC (0 for
+// locally generated packets) and ruleSrc are what policy rules match.
+func (s *Stack) findRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber, multicastLoop bool, inNIC tcpip.NICID, ruleSrc tcpip.Address) (*Route, tcpip.Error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1860,55 +1874,95 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 		s.routeMu.RLock()
 		defer s.routeMu.RUnlock()
 
-		for route := s.routeTable.Front(); route != nil; route = route.Next() {
-			if remoteAddr.BitLen() != 0 && !route.Destination.Contains(remoteAddr) {
-				continue
-			}
-
-			nic, ok := s.nics[route.NIC]
-			if !ok || !nic.Enabled() {
-				continue
-			}
-
-			if id == 0 || id == route.NIC {
-				if addressEndpoint := s.getAddressEP(nic, localAddr, remoteAddr, route.SourceHint, netProto); addressEndpoint != nil {
-					var gateway tcpip.Address
-					if needRoute {
-						gateway = route.Gateway
-					}
-					r := constructAndValidateRoute(netProto, addressEndpoint, nic /* outgoingNIC */, nic /* outgoingNIC */, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop, route.MTU)
-					if r == nil {
-						panic(fmt.Sprintf("non-forwarding route validation failed with route table entry = %#v, id = %d, localAddr = %s, remoteAddr = %s", route, id, localAddr, remoteAddr))
-					}
-					return r
-				}
-			}
-
-			// If the stack has forwarding enabled, we haven't found a valid route to
-			// the remote address yet, and we are routing locally generated traffic,
-			// keep track of the first valid route. We keep iterating because we
-			// prefer routes that let us use a local address that is assigned to the
-			// outgoing interface. There is no requirement to do this from any RFC
-			// but simply a choice made to better follow a strong host model which
-			// the netstack follows at the time of writing.
-			//
-			// Note that for incoming traffic that we are forwarding (for which the
-			// NIC and local address are unspecified), we do not keep iterating, as
-			// there is no reason to prefer routes that let us use a local address
-			// when routing forwarded (as opposed to locally-generated) traffic.
-			locallyGenerated := (id != 0 || localAddr != tcpip.Address{})
-			if onlyGlobalAddresses && chosenRoute.Equal(tcpip.Route{}) && isNICForwarding(nic, netProto) {
-				if locallyGenerated {
-					chosenRoute = *route
+		// search looks for a route in one route table.
+		search := func(list *tcpip.RouteList) *Route {
+			for route := list.Front(); route != nil; route = route.Next() {
+				if remoteAddr.BitLen() != 0 && !route.Destination.Contains(remoteAddr) {
 					continue
 				}
 
-				if r := s.findRouteWithLocalAddrFromAnyInterfaceRLocked(nic, localAddr, remoteAddr, route.SourceHint, route.Gateway, netProto, multicastLoop, route.MTU); r != nil {
-					return r
+				nic, ok := s.nics[route.NIC]
+				if !ok || !nic.Enabled() {
+					continue
+				}
+
+				if id == 0 || id == route.NIC {
+					if addressEndpoint := s.getAddressEP(nic, localAddr, remoteAddr, route.SourceHint, netProto); addressEndpoint != nil {
+						var gateway tcpip.Address
+						if needRoute {
+							gateway = route.Gateway
+						}
+						r := constructAndValidateRoute(netProto, addressEndpoint, nic /* outgoingNIC */, nic /* outgoingNIC */, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop, route.MTU)
+						if r == nil {
+							panic(fmt.Sprintf("non-forwarding route validation failed with route table entry = %#v, id = %d, localAddr = %s, remoteAddr = %s", route, id, localAddr, remoteAddr))
+						}
+						return r
+					}
+				}
+
+				// If the stack has forwarding enabled, we haven't found a valid route to
+				// the remote address yet, and we are routing locally generated traffic,
+				// keep track of the first valid route. We keep iterating because we
+				// prefer routes that let us use a local address that is assigned to the
+				// outgoing interface. There is no requirement to do this from any RFC
+				// but simply a choice made to better follow a strong host model which
+				// the netstack follows at the time of writing.
+				//
+				// Note that for incoming traffic that we are forwarding (for which the
+				// NIC and local address are unspecified), we do not keep iterating, as
+				// there is no reason to prefer routes that let us use a local address
+				// when routing forwarded (as opposed to locally-generated) traffic.
+				locallyGenerated := (id != 0 || localAddr != tcpip.Address{})
+				if onlyGlobalAddresses && chosenRoute.Equal(tcpip.Route{}) && isNICForwarding(nic, netProto) {
+					if locallyGenerated {
+						chosenRoute = *route
+						continue
+					}
+
+					if r := s.findRouteWithLocalAddrFromAnyInterfaceRLocked(nic, localAddr, remoteAddr, route.SourceHint, route.Gateway, netProto, multicastLoop, route.MTU); r != nil {
+						return r
+					}
 				}
 			}
+			return nil
 		}
 
+		if !s.policyRouting.Load() && s.routeTables[tcpip.RouteTableDefault] == nil {
+			return search(&s.routeTable)
+		}
+
+		// Walk the rules by priority, as Linux fib_rules_lookup() does: the
+		// first table of a matching rule that has a route wins.
+		rules := s.rules
+		if rules == nil {
+			rules = s.defaultRules()
+		}
+		inNICName := "lo"
+		if inNIC != 0 {
+			inNICName = ""
+			if nic, ok := s.nics[inNIC]; ok {
+				inNICName = nic.Name()
+			}
+		}
+		for i := range rules {
+			rule := &rules[i]
+			if rule.Table == tcpip.RouteTableLocal || !rule.Matches(netProto, ruleSrc, remoteAddr, inNICName) {
+				continue
+			}
+			list := &s.routeTable
+			if rule.Table != tcpip.RouteTableMain {
+				if list = s.routeTables[rule.Table]; list == nil {
+					continue
+				}
+			}
+			if r := search(list); r != nil {
+				return r
+			}
+			if !chosenRoute.Equal(tcpip.Route{}) {
+				// This table has a route for forwarding; use it below.
+				return nil
+			}
+		}
 		return nil
 	}(); r != nil {
 		return r, nil

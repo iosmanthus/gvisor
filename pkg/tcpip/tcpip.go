@@ -1667,6 +1667,21 @@ func (r Rule) Equal(to Rule) bool {
 	return r == to
 }
 
+// Matches returns true if a packet of netProto from src to dst that arrived
+// on the interface named inNICName matches the selectors of r. Locally
+// generated packets use inNICName "lo" and their local address (if any) as
+// src.
+func (r *Rule) Matches(netProto NetworkProtocolNumber, src, dst Address, inNICName string) bool {
+	switch {
+	case r.NetProto != netProto,
+		r.HasSrc && r.Src.Prefix() > 0 && !r.Src.Contains(src),
+		r.HasDst && r.Dst.Prefix() > 0 && !r.Dst.Contains(dst),
+		r.InNICName != "" && r.InNICName != inNICName:
+		return false
+	}
+	return true
+}
+
 // IsDefault returns true if r is one of the Linux default rules (priority 0
 // lookup local, 32766 lookup main, 32767 lookup default).
 func (r Rule) IsDefault() bool {

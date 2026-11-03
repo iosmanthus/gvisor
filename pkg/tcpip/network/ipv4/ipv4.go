@@ -922,7 +922,8 @@ func (e *endpoint) forwardUnicastPacket(pkt *stack.PacketBuffer) ip.ForwardingEr
 		return nil
 	}
 
-	r, err := stk.FindRoute(0, tcpip.Address{}, dstAddr, ProtocolNumber, false /* multicastLoop */)
+	// Policy rules see the input interface and the source, as in Linux.
+	r, err := stk.FindRouteForForwarding(e.nic.ID(), h.SourceAddress(), dstAddr, ProtocolNumber)
 	switch err.(type) {
 	case nil:
 	case *tcpip.ErrNetworkUnreachable:
