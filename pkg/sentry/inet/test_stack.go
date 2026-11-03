@@ -179,6 +179,21 @@ func (s *TestStack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 	return syserr.ErrNotPermitted
 }
 
+// RuleTable implements Stack.
+func (s *TestStack) RuleTable() []Rule {
+	return nil
+}
+
+// NewRule implements Stack.
+func (s *TestStack) NewRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	return syserr.ErrNotSupported
+}
+
+// RemoveRule implements Stack.
+func (s *TestStack) RemoveRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	return syserr.ErrNotSupported
+}
+
 // Pause implements Stack.
 func (s *TestStack) Pause() {}
 

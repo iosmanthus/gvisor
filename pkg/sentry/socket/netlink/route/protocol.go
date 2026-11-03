@@ -515,7 +515,14 @@ func (p *Protocol) dumpRoutes(ctx context.Context, s *netlink.Socket, msg *nlmsg
 		if err != nil {
 			return err
 		}
-		route, err := fillRoute(routeTables, family, dst)
+		// A single lookup uses the main table.
+		var main []inet.Route
+		for _, rt := range routeTables {
+			if rt.Table == linux.RT_TABLE_MAIN {
+				main = append(main, rt)
+			}
+		}
+		route, err := fillRoute(main, family, dst)
 		if err != nil {
 			return err
 		}
@@ -551,21 +558,26 @@ func (p *Protocol) AddRouteMessage(ms *nlmsg.MessageSet, typ uint16, nlFlags uin
 		Flags: nlFlags,
 	})
 
+	table := rt.Table
+	if table == linux.RT_TABLE_UNSPEC {
+		table = linux.RT_TABLE_MAIN
+	}
 	m.Put(&linux.RouteMessage{
 		Family: rt.Family,
 		DstLen: rt.DstLen,
 		SrcLen: rt.SrcLen,
 		TOS:    rt.TOS,
 
-		// Always return the main table since we don't have multiple
-		// routing tables.
-		Table:    linux.RT_TABLE_MAIN,
+		// As in Linux, a table ID that does not fit the header is
+		// RT_TABLE_COMPAT there and the full ID is in RTA_TABLE.
+		Table:    headerTable(table),
 		Protocol: rt.Protocol,
 		Scope:    rt.Scope,
 		Type:     rt.Type,
 
 		Flags: rt.Flags,
 	})
+	m.PutAttr(linux.RTA_TABLE, primitive.AllocateUint32(table))
 
 	if rt.DstLen > 0 {
 		m.PutAttr(linux.RTA_DST, primitive.AsByteSlice(rt.DstAddr))
@@ -584,6 +596,73 @@ func (p *Protocol) AddRouteMessage(ms *nlmsg.MessageSet, typ uint16, nlFlags uin
 	}
 
 	// TODO(gvisor.dev/issue/578): There are many more attributes.
+}
+
+// headerTable returns the table ID for the 8-bit table field of route and rule
+// headers.
+func headerTable(table uint32) uint8 {
+	if table > 255 {
+		return linux.RT_TABLE_COMPAT
+	}
+	return uint8(table)
+}
+
+// newRule handles RTM_NEWRULE requests.
+func (p *Protocol) newRule(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
+	if stack == nil {
+		return syserr.ErrProtocolNotSupported
+	}
+	return stack.NewRule(ctx, msg)
+}
+
+// deleteRule handles RTM_DELRULE requests.
+func (p *Protocol) deleteRule(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
+	if stack == nil {
+		return syserr.ErrProtocolNotSupported
+	}
+	return stack.RemoveRule(ctx, msg)
+}
+
+// dumpRules handles RTM_GETRULE dump requests. Rule changes are not announced
+// to multicast groups.
+func (p *Protocol) dumpRules(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	// We always send back an NLMSG_DONE.
+	ms.Multi = true
+	stack := s.Stack()
+	if stack == nil {
+		return nil
+	}
+	var family primitive.Uint8
+	msg.GetData(&family)
+	for _, r := range stack.RuleTable() {
+		if uint8(family) != linux.AF_UNSPEC && r.Family != uint8(family) {
+			continue
+		}
+		m := ms.AddMessage(linux.NetlinkMessageHeader{Type: linux.RTM_NEWRULE})
+		m.Put(&linux.FibRuleHdr{
+			Family: r.Family,
+			DstLen: r.DstLen,
+			SrcLen: r.SrcLen,
+			Table:  headerTable(r.Table),
+			Action: r.Action,
+		})
+		m.PutAttr(linux.FRA_TABLE, primitive.AllocateUint32(r.Table))
+		if r.Priority != 0 {
+			m.PutAttr(linux.FRA_PRIORITY, primitive.AllocateUint32(r.Priority))
+		}
+		if r.DstLen > 0 {
+			m.PutAttr(linux.FRA_DST, primitive.AsByteSlice(r.DstAddr))
+		}
+		if r.SrcLen > 0 {
+			m.PutAttr(linux.FRA_SRC, primitive.AsByteSlice(r.SrcAddr))
+		}
+		if r.IIfName != "" {
+			m.PutAttrString(linux.FRA_IIFNAME, r.IIfName)
+		}
+	}
+	return nil
 }
 
 // withOrigin returns a context under which changes made while handling msg are
@@ -723,6 +802,8 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 			return p.dumpAddrs(ctx, s, msg, ms)
 		case linux.RTM_GETROUTE:
 			return p.dumpRoutes(ctx, s, msg, ms)
+		case linux.RTM_GETRULE:
+			return p.dumpRules(ctx, s, msg, ms)
 		default:
 			return syserr.ErrNotSupported
 		}
@@ -743,6 +824,10 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 			return p.dumpRoutes(ctx, s, msg, ms)
 		case linux.RTM_DELROUTE:
 			return p.deleteRoute(ctx, s, msg, ms)
+		case linux.RTM_NEWRULE:
+			return p.newRule(ctx, s, msg, ms)
+		case linux.RTM_DELRULE:
+			return p.deleteRule(ctx, s, msg, ms)
 		case linux.RTM_GETADDR:
 			return p.dumpAddrs(ctx, s, msg, ms)
 		case linux.RTM_NEWADDR:

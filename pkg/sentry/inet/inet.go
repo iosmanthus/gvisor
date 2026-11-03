@@ -97,6 +97,16 @@ type Stack interface {
 	// NewRoute adds the given route to the network stack's route table.
 	NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
 
+	// RuleTable returns the network stack's policy routing rules, sorted by
+	// priority.
+	RuleTable() []Rule
+
+	// NewRule adds the policy routing rule of an RTM_NEWRULE message.
+	NewRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error
+
+	// RemoveRule removes the policy routing rule of an RTM_DELRULE message.
+	RemoveRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error
+
 	// Pause pauses the network stack before save.
 	Pause()
 
@@ -214,6 +224,34 @@ type TCPBufferSize struct {
 // interface.
 type StatDev [16]uint64
 
+// Rule is a policy routing rule, as RTM_GETRULE reports it.
+type Rule struct {
+	// Family is the address family, a Linux AF_* constant.
+	Family uint8
+
+	// DstLen and SrcLen are the prefix lengths of DstAddr and SrcAddr. Zero
+	// means the rule matches all addresses.
+	DstLen uint8
+	SrcLen uint8
+
+	// Action is a Linux FR_ACT_* constant.
+	Action uint8
+
+	// Table is the route table ID.
+	Table uint32
+
+	// Priority orders the rules; the lowest value is tried first.
+	Priority uint32
+
+	// DstAddr and SrcAddr are the addresses of the selectors (FRA_DST,
+	// FRA_SRC).
+	DstAddr []byte
+	SrcAddr []byte
+
+	// IIfName is the input interface selector (FRA_IIFNAME), or empty.
+	IIfName string
+}
+
 // Route contains information about a network route.
 type Route struct {
 	// Family is the address family, a Linux AF_* constant.
@@ -229,7 +267,7 @@ type Route struct {
 	TOS uint8
 
 	// Table is the routing table ID.
-	Table uint8
+	Table uint32
 
 	// Protocol is the route origin, a Linux RTPROT_* constant.
 	Protocol uint8

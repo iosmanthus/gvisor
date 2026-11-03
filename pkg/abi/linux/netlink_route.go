@@ -255,6 +255,64 @@ type RouteMessage struct {
 // SizeOfRouteMessage is the size of RouteMessage.
 const SizeOfRouteMessage = 12
 
+// FibRuleHdr is struct fib_rule_hdr, from uapi/linux/fib_rules.h. It is the
+// header of RTM_NEWRULE, RTM_DELRULE and RTM_GETRULE messages.
+//
+// +marshal
+type FibRuleHdr struct {
+	_      structs.HostLayout
+	Family uint8
+	DstLen uint8
+	SrcLen uint8
+	TOS    uint8
+
+	Table  uint8
+	Res1   uint8
+	Res2   uint8
+	Action uint8
+
+	Flags uint32
+}
+
+// SizeOfFibRuleHdr is the size of FibRuleHdr.
+const SizeOfFibRuleHdr = 12
+
+// Rule attributes, from uapi/linux/fib_rules.h.
+const (
+	FRA_UNSPEC             = 0
+	FRA_DST                = 1
+	FRA_SRC                = 2
+	FRA_IIFNAME            = 3
+	FRA_GOTO               = 4
+	FRA_PRIORITY           = 6
+	FRA_FWMARK             = 10
+	FRA_FLOW               = 11
+	FRA_TUN_ID             = 12
+	FRA_SUPPRESS_IFGROUP   = 13
+	FRA_SUPPRESS_PREFIXLEN = 14
+	FRA_TABLE              = 15
+	FRA_FWMASK             = 16
+	FRA_OIFNAME            = 17
+	FRA_PAD                = 18
+	FRA_L3MDEV             = 19
+	FRA_UID_RANGE          = 20
+	FRA_PROTOCOL           = 21
+	FRA_IP_PROTO           = 22
+	FRA_SPORT_RANGE        = 23
+	FRA_DPORT_RANGE        = 24
+)
+
+// Rule actions, from uapi/linux/fib_rules.h.
+const (
+	FR_ACT_UNSPEC      = 0
+	FR_ACT_TO_TBL      = 1
+	FR_ACT_GOTO        = 2
+	FR_ACT_NOP         = 3
+	FR_ACT_BLACKHOLE   = 6
+	FR_ACT_UNREACHABLE = 7
+	FR_ACT_PROHIBIT    = 8
+)
+
 // Route types, from uapi/linux/rtnetlink.h.
 const (
 	// RTN_UNSPEC represents an unspecified route type.

@@ -333,6 +333,7 @@ go_test(
         "neighbor_entry_test.go",
         "nic_test.go",
         "packet_buffer_test.go",
+        "route_table_test.go",
     ],
     embed = [":stack"],
     deps = [

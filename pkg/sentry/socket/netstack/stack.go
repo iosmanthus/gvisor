@@ -1039,6 +1039,8 @@ func makeInetRoute(rt tcpip.Route) (inet.Route, bool) {
 		Scope: linux.RT_SCOPE_LINK,
 		Type:  linux.RTN_UNICAST,
 
+		Table: rt.TableID(),
+
 		DstAddr:         dstAddr.AsSlice(),
 		OutputInterface: int32(rt.NIC),
 		GatewayAddr:     rt.Gateway.AsSlice(),
@@ -1058,7 +1060,7 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 		DstLen:   rtMsg.DstLen,
 		SrcLen:   rtMsg.SrcLen,
 		TOS:      rtMsg.TOS,
-		Table:    rtMsg.Table,
+		Table:    uint32(rtMsg.Table),
 		Protocol: rtMsg.Protocol,
 		Scope:    rtMsg.Scope,
 		Type:     rtMsg.Type,
@@ -1099,6 +1101,14 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 			}
 			route.GatewayAddr = value
 		case linux.RTA_PRIORITY:
+		case linux.RTA_TABLE:
+			// RTA_TABLE wins over rtm_table, as in Linux.
+			v := nlmsg.BytesView(value)
+			table, ok := v.Uint32()
+			if !ok {
+				return tcpip.Route{}, syserr.ErrInvalidArgument
+			}
+			route.Table = table
 		default:
 			log.Warningf("Unknown attribute: %v", ahdr.Type)
 			return tcpip.Route{}, syserr.ErrNotSupported
@@ -1157,10 +1167,21 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 			PrefixLen: int(route.DstLen)}.Subnet()
 	}
 
+	// An unspecified table means main, as in Linux fib_get_table(). Local
+	// routes are implicit in netstack.
+	table := route.Table
+	switch table {
+	case linux.RT_TABLE_UNSPEC, linux.RT_TABLE_MAIN:
+		table = 0
+	case linux.RT_TABLE_LOCAL:
+		return tcpip.Route{}, syserr.ErrNotSupported
+	}
+
 	localRoute := tcpip.Route{
 		Destination: dest,
 		Gateway:     tcpip.AddrFromSlice(route.GatewayAddr),
 		NIC:         tcpip.NICID(route.OutputInterface),
+		Table:       table,
 	}
 
 	if len(route.SrcAddr) != 0 {
@@ -1168,6 +1189,187 @@ func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
 	}
 
 	return localRoute, nil
+}
+
+// ruleRequest is a rule parsed from an RTM_NEWRULE or RTM_DELRULE message.
+type ruleRequest struct {
+	rule   tcpip.Rule
+	action uint8
+	// prioSet is true if the message has FRA_PRIORITY.
+	prioSet bool
+	// srcLen and dstLen are the prefix lengths of the header.
+	srcLen, dstLen uint8
+}
+
+// parseRule reads a rule message.
+func parseRule(msg *nlmsg.Message) (ruleRequest, *syserr.Error) {
+	var hdr linux.FibRuleHdr
+	attrs, ok := msg.GetData(&hdr)
+	if !ok {
+		return ruleRequest{}, syserr.ErrInvalidArgument
+	}
+	var addrLen int
+	r := ruleRequest{action: hdr.Action, srcLen: hdr.SrcLen, dstLen: hdr.DstLen}
+	switch hdr.Family {
+	case linux.AF_INET:
+		r.rule.NetProto, addrLen = header.IPv4ProtocolNumber, header.IPv4AddressSize
+	case linux.AF_INET6:
+		r.rule.NetProto, addrLen = header.IPv6ProtocolNumber, header.IPv6AddressSize
+	default:
+		return ruleRequest{}, syserr.ErrAddressFamilyNotSupported
+	}
+	if int(hdr.SrcLen) > addrLen*8 || int(hdr.DstLen) > addrLen*8 {
+		return ruleRequest{}, syserr.ErrInvalidArgument
+	}
+	r.rule.Table = uint32(hdr.Table)
+	subnet := func(value []byte, prefix uint8) (tcpip.Subnet, *syserr.Error) {
+		if len(value) != addrLen {
+			return tcpip.Subnet{}, syserr.ErrInvalidArgument
+		}
+		return tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(value), PrefixLen: int(prefix)}.Subnet(), nil
+	}
+	for !attrs.Empty() {
+		ahdr, value, rest, ok := attrs.ParseFirst()
+		if !ok {
+			return ruleRequest{}, syserr.ErrInvalidArgument
+		}
+		attrs = rest
+		var err *syserr.Error
+		v := nlmsg.BytesView(value)
+		switch ahdr.Type {
+		case linux.FRA_PRIORITY:
+			r.rule.Priority, ok = v.Uint32()
+			r.prioSet = true
+		case linux.FRA_TABLE:
+			var table uint32
+			if table, ok = v.Uint32(); ok && table != 0 {
+				r.rule.Table = table
+			}
+		case linux.FRA_SRC:
+			r.rule.Src, err = subnet(value, hdr.SrcLen)
+			r.rule.HasSrc = true
+		case linux.FRA_DST:
+			r.rule.Dst, err = subnet(value, hdr.DstLen)
+			r.rule.HasDst = true
+		case linux.FRA_IIFNAME:
+			name := v.String()
+			if len(name) >= linux.IFNAMSIZ {
+				return ruleRequest{}, syserr.ErrInvalidArgument
+			}
+			r.rule.InNICName = name
+		case linux.FRA_PROTOCOL, linux.FRA_PAD:
+		default:
+			return ruleRequest{}, syserr.ErrNotSupported
+		}
+		if !ok {
+			return ruleRequest{}, syserr.ErrInvalidArgument
+		}
+		if err != nil {
+			return ruleRequest{}, err
+		}
+	}
+	// A prefix length needs its address.
+	if (hdr.SrcLen > 0 && !r.rule.HasSrc) || (hdr.DstLen > 0 && !r.rule.HasDst) {
+		return ruleRequest{}, syserr.ErrInvalidArgument
+	}
+	return r, nil
+}
+
+// defaultRulePriority returns the priority of a new rule without
+// FRA_PRIORITY: one below the second rule of the protocol, as Linux
+// fib_default_rule_pref() does.
+func defaultRulePriority(rules []tcpip.Rule, proto tcpip.NetworkProtocolNumber) uint32 {
+	n := 0
+	for _, r := range rules {
+		if r.NetProto != proto {
+			continue
+		}
+		if n++; n == 2 && r.Priority > 0 {
+			return r.Priority - 1
+		}
+	}
+	return 0
+}
+
+// NewRule implements inet.Stack.NewRule.
+func (s *Stack) NewRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	r, err := parseRule(msg)
+	if err != nil {
+		return err
+	}
+	if r.action != linux.FR_ACT_TO_TBL {
+		return syserr.ErrNotSupported
+	}
+	if r.rule.Table == linux.RT_TABLE_UNSPEC {
+		return syserr.ErrInvalidArgument
+	}
+	if !r.prioSet {
+		r.rule.Priority = defaultRulePriority(s.Stack.GetRules(), r.rule.NetProto)
+	}
+	if !s.Stack.AddRule(r.rule) && msg.Header().Flags&linux.NLM_F_EXCL != 0 {
+		return syserr.ErrExists
+	}
+	return nil
+}
+
+// RemoveRule implements inet.Stack.RemoveRule. It removes the first rule that
+// matches every selector the message sets, as Linux rule_find() does.
+func (s *Stack) RemoveRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	r, err := parseRule(msg)
+	if err != nil {
+		return err
+	}
+	want := r.rule
+	if !s.Stack.RemoveRule(func(rule tcpip.Rule) bool {
+		switch {
+		case rule.NetProto != want.NetProto,
+			want.Table != 0 && rule.Table != want.Table,
+			r.prioSet && rule.Priority != want.Priority,
+			want.InNICName != "" && rule.InNICName != want.InNICName,
+			want.HasSrc && (!rule.HasSrc || rule.Src != want.Src),
+			want.HasDst && (!rule.HasDst || rule.Dst != want.Dst),
+			r.srcLen != 0 && rule.Src.Prefix() != int(r.srcLen),
+			r.dstLen != 0 && rule.Dst.Prefix() != int(r.dstLen):
+			return false
+		}
+		return true
+	}) {
+		return syserr.ErrNoFileOrDir
+	}
+	return nil
+}
+
+// RuleTable implements inet.Stack.RuleTable.
+func (s *Stack) RuleTable() []inet.Rule {
+	var out []inet.Rule
+	for _, r := range s.Stack.GetRules() {
+		rule := inet.Rule{
+			Action:   linux.FR_ACT_TO_TBL,
+			Table:    r.Table,
+			Priority: r.Priority,
+			IIfName:  r.InNICName,
+		}
+		switch r.NetProto {
+		case header.IPv4ProtocolNumber:
+			rule.Family = linux.AF_INET
+		case header.IPv6ProtocolNumber:
+			rule.Family = linux.AF_INET6
+		default:
+			continue
+		}
+		if r.HasSrc {
+			rule.SrcLen = uint8(r.Src.Prefix())
+			addr := r.Src.ID()
+			rule.SrcAddr = addr.AsSlice()
+		}
+		if r.HasDst {
+			rule.DstLen = uint8(r.Dst.Prefix())
+			addr := r.Dst.ID()
+			rule.DstAddr = addr.AsSlice()
+		}
+		out = append(out, rule)
+	}
+	return out
 }
 
 // RemoveRoute implements inte.Stack.RemoveRoute.
@@ -1189,6 +1391,9 @@ func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Err
 			return false
 		}
 		if localRoute.NIC > 0 && localRoute.NIC != rt.NIC {
+			return false
+		}
+		if localRoute.TableID() != rt.TableID() {
 			return false
 		}
 		found = rt.Destination.Equal(localRoute.Destination)
@@ -1215,7 +1420,7 @@ func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error 
 	found := false
 	sameDst := false
 	for _, rt := range s.Stack.GetRouteTable() {
-		if rt.Destination.Equal(localRoute.Destination) {
+		if rt.Destination.Equal(localRoute.Destination) && rt.TableID() == localRoute.TableID() {
 			sameDst = true
 		}
 		if localRoute.Equal(rt) {

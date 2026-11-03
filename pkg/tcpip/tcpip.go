@@ -1600,6 +1600,25 @@ type Route struct {
 	// If MTU is 0, this field is ignored and the MTU of the NIC for which this route
 	// is configured is used for egress packets.
 	MTU uint32
+
+	// Table is the ID of the route table that holds this route. 0 means the
+	// main table (RouteTableMain).
+	Table uint32
+}
+
+// Route table IDs, as in Linux.
+const (
+	RouteTableDefault = 253
+	RouteTableMain    = 254
+	RouteTableLocal   = 255
+)
+
+// TableID returns the table of r, with 0 normalized to RouteTableMain.
+func (r Route) TableID() uint32 {
+	if r.Table == 0 {
+		return RouteTableMain
+	}
+	return r.Table
 }
 
 // String implements the fmt.Stringer interface.
@@ -1616,7 +1635,51 @@ func (r Route) String() string {
 // Equal returns true if the given Route is equal to this Route.
 func (r Route) Equal(to Route) bool {
 	// NOTE: This relies on the fact that r.Destination == to.Destination
-	return r.Destination.Equal(to.Destination) && r.NIC == to.NIC
+	return r.Destination.Equal(to.Destination) && r.NIC == to.NIC && r.TableID() == to.TableID()
+}
+
+// Rule is a policy routing rule with the Linux action FR_ACT_TO_TBL: a packet
+// that matches the selectors is routed with the route table Table.
+type Rule struct {
+	// Priority orders the rules; the lowest value is tried first.
+	Priority uint32
+
+	// NetProto is the network protocol the rule applies to.
+	NetProto NetworkProtocolNumber
+
+	// Src and Dst match the source and the destination address when HasSrc
+	// and HasDst are set. Otherwise they match all addresses.
+	Src    Subnet
+	HasSrc bool
+	Dst    Subnet
+	HasDst bool
+
+	// InNICName matches the name of the input interface. Empty matches all.
+	// Locally generated packets have the input interface "lo", as in Linux.
+	InNICName string
+
+	// Table is the ID of the route table to use.
+	Table uint32
+}
+
+// Equal returns true if r and to have the same priority, selectors and table.
+func (r Rule) Equal(to Rule) bool {
+	return r == to
+}
+
+// IsDefault returns true if r is one of the Linux default rules (priority 0
+// lookup local, 32766 lookup main, 32767 lookup default).
+func (r Rule) IsDefault() bool {
+	if r.HasSrc || r.HasDst || r.InNICName != "" {
+		return false
+	}
+	switch {
+	case r.Priority == 0 && r.Table == RouteTableLocal,
+		r.Priority == 32766 && r.Table == RouteTableMain,
+		r.Priority == 32767 && r.Table == RouteTableDefault:
+		return true
+	}
+	return false
 }
 
 // TransportProtocolNumber is the number of a transport protocol.

@@ -459,6 +459,22 @@ func (*Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
 	return nil
 }
 
+// RuleTable implements inet.Stack.RuleTable. Host networking does not report
+// the host's policy rules.
+func (*Stack) RuleTable() []inet.Rule {
+	return nil
+}
+
+// NewRule implements inet.Stack.NewRule.
+func (*Stack) NewRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	return syserr.ErrNotSupported
+}
+
+// RemoveRule implements inet.Stack.RemoveRule.
+func (*Stack) RemoveRule(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	return syserr.ErrNotSupported
+}
+
 // Pause implements inet.Stack.Pause.
 func (*Stack) Pause() {}
 

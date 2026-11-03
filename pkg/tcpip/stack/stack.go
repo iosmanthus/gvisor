@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -90,8 +91,23 @@ type Stack struct {
 	routeMu routeStackRWMutex `state:"nosave"`
 
 	// routeTable is a list of routes sorted by prefix length, longest (most specific) first.
+	// It is the main route table.
 	// +checklocks:routeMu
 	routeTable tcpip.RouteList `state:"nosave"`
+
+	// routeTables holds the route tables other than main, by table ID, each
+	// sorted as routeTable. Main stays in routeTable, so that a stack without
+	// policy rules does the same work as before.
+	// +checklocks:routeMu
+	routeTables map[uint32]*tcpip.RouteList `state:"nosave"`
+
+	// rules are the policy routing rules, sorted by priority. nil means the
+	// Linux default rules for every network protocol of the stack.
+	// +checklocks:routeMu
+	rules []tcpip.Rule
+
+	// policyRouting is true when rules differ from the default rules.
+	policyRouting atomicbitops.Bool
 
 	mu stackRWMutex `state:"nosave"`
 	// +checklocks:mu
@@ -838,7 +854,8 @@ func (s *Stack) SetRouteTable(table []tcpip.Route) {
 	}
 }
 
-// GetRouteTable returns the route table which is currently in use.
+// GetRouteTable returns the routes of all route tables: the main table
+// first, then the other tables by table ID.
 func (s *Stack) GetRouteTable() []tcpip.Route {
 	s.routeMu.RLock()
 	defer s.routeMu.RUnlock()
@@ -846,7 +863,44 @@ func (s *Stack) GetRouteTable() []tcpip.Route {
 	for r := s.routeTable.Front(); r != nil; r = r.Next() {
 		table = append(table, *r)
 	}
+	for _, id := range s.otherTableIDsLocked() {
+		for r := s.routeTables[id].Front(); r != nil; r = r.Next() {
+			table = append(table, *r)
+		}
+	}
 	return table
+}
+
+// otherTableIDsLocked returns the IDs of the route tables other than main,
+// sorted.
+//
+// +checklocksread:s.routeMu
+func (s *Stack) otherTableIDsLocked() []uint32 {
+	ids := make([]uint32, 0, len(s.routeTables))
+	for id := range s.routeTables {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// routeListLocked returns the list of route table id. If the table does not
+// exist, it is created when create is true and nil is returned otherwise.
+//
+// +checklocks:s.routeMu
+func (s *Stack) routeListLocked(id uint32, create bool) *tcpip.RouteList {
+	if id == 0 || id == tcpip.RouteTableMain {
+		return &s.routeTable
+	}
+	l := s.routeTables[id]
+	if l == nil && create {
+		if s.routeTables == nil {
+			s.routeTables = make(map[uint32]*tcpip.RouteList)
+		}
+		l = &tcpip.RouteList{}
+		s.routeTables[id] = l
+	}
+	return l
 }
 
 // AddRoute appends a route to the route table.
@@ -858,15 +912,16 @@ func (s *Stack) AddRoute(route tcpip.Route) {
 
 // +checklocks:s.routeMu
 func (s *Stack) addRouteLocked(route *tcpip.Route) {
+	list := s.routeListLocked(route.Table, true)
 	routePrefix := route.Destination.Prefix()
-	n := s.routeTable.Front()
+	n := list.Front()
 	for ; n != nil; n = n.Next() {
 		if n.Destination.Prefix() < routePrefix {
-			s.routeTable.InsertBefore(n, route)
+			list.InsertBefore(n, route)
 			return
 		}
 	}
-	s.routeTable.PushBack(route)
+	list.PushBack(route)
 }
 
 // RemoveRoutes removes matching routes from the route table, it
@@ -880,16 +935,111 @@ func (s *Stack) RemoveRoutes(match func(tcpip.Route) bool) int {
 
 // +checklocks:s.routeMu
 func (s *Stack) removeRoutesLocked(match func(tcpip.Route) bool) int {
+	count := removeFromList(&s.routeTable, match)
+	for id, list := range s.routeTables {
+		count += removeFromList(list, match)
+		if list.Empty() {
+			delete(s.routeTables, id)
+		}
+	}
+	return count
+}
+
+// removeFromList removes the routes of list for which match returns true and
+// returns their number.
+func removeFromList(list *tcpip.RouteList, match func(tcpip.Route) bool) int {
 	count := 0
-	for route := s.routeTable.Front(); route != nil; {
+	for route := list.Front(); route != nil; {
 		next := route.Next()
 		if match(*route) {
-			s.routeTable.Remove(route)
+			list.Remove(route)
 			count++
 		}
 		route = next
 	}
 	return count
+}
+
+// defaultRules returns the Linux default rules (priority 0 lookup local,
+// 32766 lookup main, 32767 lookup default) for each network protocol of the
+// stack.
+func (s *Stack) defaultRules() []tcpip.Rule {
+	protos := make([]tcpip.NetworkProtocolNumber, 0, len(s.networkProtocols))
+	for p := range s.networkProtocols {
+		protos = append(protos, p)
+	}
+	slices.Sort(protos)
+	var rules []tcpip.Rule
+	for _, d := range []struct{ prio, table uint32 }{
+		{0, tcpip.RouteTableLocal},
+		{32766, tcpip.RouteTableMain},
+		{32767, tcpip.RouteTableDefault},
+	} {
+		for _, p := range protos {
+			rules = append(rules, tcpip.Rule{Priority: d.prio, NetProto: p, Table: d.table})
+		}
+	}
+	return rules
+}
+
+// GetRules returns the policy routing rules, sorted by priority.
+func (s *Stack) GetRules() []tcpip.Rule {
+	s.routeMu.RLock()
+	defer s.routeMu.RUnlock()
+	if s.rules == nil {
+		return s.defaultRules()
+	}
+	return slices.Clone(s.rules)
+}
+
+// AddRule adds rule after the rules with the same or a lower priority, as
+// Linux does. It returns false and changes nothing if an equal rule exists.
+func (s *Stack) AddRule(rule tcpip.Rule) bool {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if s.rules == nil {
+		s.rules = s.defaultRules()
+	}
+	pos := len(s.rules)
+	for i, r := range s.rules {
+		if r.Equal(rule) {
+			return false
+		}
+		if pos == len(s.rules) && r.Priority > rule.Priority {
+			pos = i
+		}
+	}
+	s.rules = slices.Insert(s.rules, pos, rule)
+	s.updatePolicyRoutingLocked()
+	return true
+}
+
+// RemoveRule removes the first rule for which match returns true, as Linux
+// does. It returns false if no rule matches.
+func (s *Stack) RemoveRule(match func(tcpip.Rule) bool) bool {
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if s.rules == nil {
+		s.rules = s.defaultRules()
+	}
+	for i, r := range s.rules {
+		if match(r) {
+			s.rules = slices.Delete(s.rules, i, i+1)
+			s.updatePolicyRoutingLocked()
+			return true
+		}
+	}
+	return false
+}
+
+// PolicyRouting returns true if the rules differ from the default rules.
+func (s *Stack) PolicyRouting() bool {
+	return s.policyRouting.Load()
+}
+
+// +checklocks:s.routeMu
+func (s *Stack) updatePolicyRoutingLocked() {
+	s.policyRouting.Store(!slices.EqualFunc(s.rules, s.defaultRules(), tcpip.Rule.Equal))
 }
 
 // ReplaceRoute replaces the route in the routing table which matches
@@ -1147,15 +1297,9 @@ func (s *Stack) removeNICLocked(id tcpip.NICID, closeLinkEndpoint bool) (func(),
 		}
 	}
 
-	// Remove routes in-place. n tracks the number of routes written.
+	// Remove the routes of the NIC from every route table.
 	s.routeMu.Lock()
-	for r := s.routeTable.Front(); r != nil; {
-		next := r.Next()
-		if r.NIC == id {
-			s.routeTable.Remove(r)
-		}
-		r = next
-	}
+	s.removeRoutesLocked(func(r tcpip.Route) bool { return r.NIC == id })
 	s.routeMu.Unlock()
 
 	if s.loopbackNIC == nic {

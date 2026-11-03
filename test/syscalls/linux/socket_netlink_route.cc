@@ -3037,9 +3037,6 @@ TEST(NetlinkRouteTest, DeleteIpv6RouteIgnoresType) {
 
 // GetRuleDump tests a RTM_GETRULE + NLM_F_DUMP request.
 TEST(NetlinkRouteTest, GetRuleDump) {
-  // Gvisor does not support `RTM_GETRULE`
-  SKIP_IF(IsRunningOnGvisor());
-
   FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
@@ -3092,8 +3089,6 @@ TEST(NetlinkRouteTest, GetRuleDump) {
 }
 
 TEST_P(NetlinkRouteIpInvariantTest, AddAndRemoveRule) {
-  // Gvisor does not support `RTM_NEWRULE` or `RTM_DELRULE`.
-  SKIP_IF(IsRunningOnGvisor());
   // CAP_NET_ADMIN is required to modify the rule table.
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
@@ -3145,6 +3140,81 @@ TEST_P(NetlinkRouteIpInvariantTest, AddAndRemoveRule) {
   EXPECT_THAT(
       DelLookupInTableRule(family, kTable, kPriority, prefixlen, dst, dst_len),
       PosixErrorIs(ENOENT, _));
+}
+
+// A route added to table 100 is not in the main table, and the dump reports
+// its table. Main-table changes do not touch it.
+TEST(NetlinkRouteTest, RouteInTable) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  const uint32_t kTable = 100;
+  Link lo = ASSERT_NO_ERRNO_AND_VALUE(LoopbackLink());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  struct in_addr dst;
+  ASSERT_EQ(inet_pton(AF_INET, "198.51.100.0", &dst), 1);
+  const std::string want_dst(reinterpret_cast<const char*>(&dst), sizeof(dst));
+
+  struct {
+    struct nlmsghdr hdr;
+    struct rtmsg rt;
+    char buf[64];
+  } req = {};
+  auto add_attr = [&](uint16_t type, const void* data, size_t len) {
+    auto* a = reinterpret_cast<struct rtattr*>(
+        reinterpret_cast<char*>(&req) + NLMSG_ALIGN(req.hdr.nlmsg_len));
+    a->rta_type = type;
+    a->rta_len = RTA_LENGTH(len);
+    memcpy(RTA_DATA(a), data, len);
+    req.hdr.nlmsg_len = NLMSG_ALIGN(req.hdr.nlmsg_len) + RTA_ALIGN(a->rta_len);
+  };
+  auto build = [&](uint16_t type, uint16_t flags, uint8_t table) {
+    memset(&req, 0, sizeof(req));
+    req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.rt));
+    req.hdr.nlmsg_type = type;
+    req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | flags;
+    req.hdr.nlmsg_seq = 1;
+    req.rt.rtm_family = AF_INET;
+    req.rt.rtm_dst_len = 24;
+    req.rt.rtm_table = table;
+    req.rt.rtm_protocol = RTPROT_BOOT;
+    req.rt.rtm_scope = RT_SCOPE_LINK;
+    req.rt.rtm_type = RTN_UNICAST;
+    add_attr(RTA_DST, &dst, sizeof(dst));
+    int oif = lo.index;
+    add_attr(RTA_OIF, &oif, sizeof(oif));
+  };
+  // tables returns the tables that hold 198.51.100.0/24.
+  auto tables = [&]() {
+    std::vector<uint32_t> out;
+    EXPECT_NO_ERRNO(DumpRoutes(fd, AF_INET, [&](const struct nlmsghdr* hdr) {
+      const auto* rt = reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+      if (rt->rtm_dst_len == 24 && RouteDst(hdr) == want_dst) {
+        out.push_back(RouteTable(hdr));
+      }
+    }));
+    return out;
+  };
+
+  build(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, kTable);
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, 1, &req, req.hdr.nlmsg_len));
+  EXPECT_THAT(tables(), ::testing::ElementsAre(kTable));
+
+  // The same prefix in main is a separate route.
+  build(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, RT_TABLE_MAIN);
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, 1, &req, req.hdr.nlmsg_len));
+  EXPECT_THAT(tables(),
+              ::testing::UnorderedElementsAre(kTable, RT_TABLE_MAIN));
+
+  // Deleting it from main leaves table 100 alone.
+  build(RTM_DELROUTE, 0, RT_TABLE_MAIN);
+  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, 1, &req, req.hdr.nlmsg_len));
+  EXPECT_THAT(tables(), ::testing::ElementsAre(kTable));
+  EXPECT_THAT(NetlinkRequestAckOrError(fd, 1, &req, req.hdr.nlmsg_len),
+              PosixErrorIs(ESRCH, ::testing::_));
+
+  build(RTM_DELROUTE, 0, kTable);
+  EXPECT_NO_ERRNO(NetlinkRequestAckOrError(fd, 1, &req, req.hdr.nlmsg_len));
+  EXPECT_THAT(tables(), ::testing::IsEmpty());
 }
 
 // RecvmsgTrunc tests the recvmsg MSG_TRUNC flag with zero length output

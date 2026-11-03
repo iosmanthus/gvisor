@@ -479,5 +479,54 @@ PosixError DelLookupInTableRule(int family, int table, int priority,
                                  dstlen, NetlinkModification::kDelete);
 }
 
+PosixError DumpRoutes(
+    const FileDescriptor& fd, int family,
+    const std::function<void(const struct nlmsghdr* hdr)>& fn) {
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtmsg rtm;
+  };
+  struct request req = {};
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETROUTE;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.hdr.nlmsg_seq = kSeq;
+  req.rtm.rtm_family = family;
+  return NetlinkRequestResponse(
+      fd, &req, sizeof(req),
+      [&](const struct nlmsghdr* hdr) {
+        if (hdr->nlmsg_type == RTM_NEWROUTE) {
+          fn(hdr);
+        }
+      },
+      false);
+}
+
+uint32_t RouteTable(const struct nlmsghdr* hdr) {
+  const auto* rt = reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+  uint32_t table = rt->rtm_table;
+  int len = RTM_PAYLOAD(hdr);
+  for (const struct rtattr* a = RTM_RTA(rt); RTA_OK(a, len);
+       a = RTA_NEXT(a, len)) {
+    if (a->rta_type == RTA_TABLE && RTA_PAYLOAD(a) >= sizeof(table)) {
+      memcpy(&table, RTA_DATA(a), sizeof(table));
+    }
+  }
+  return table;
+}
+
+std::string RouteDst(const struct nlmsghdr* hdr) {
+  const auto* rt = reinterpret_cast<const struct rtmsg*>(NLMSG_DATA(hdr));
+  int len = RTM_PAYLOAD(hdr);
+  for (const struct rtattr* a = RTM_RTA(rt); RTA_OK(a, len);
+       a = RTA_NEXT(a, len)) {
+    if (a->rta_type == RTA_DST) {
+      return std::string(reinterpret_cast<const char*>(RTA_DATA(a)),
+                         RTA_PAYLOAD(a));
+    }
+  }
+  return "";
+}
+
 }  // namespace testing
 }  // namespace gvisor
