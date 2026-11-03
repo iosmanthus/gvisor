@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 #include <poll.h>
 #include <sched.h>
 #include <sys/ioctl.h>
@@ -599,8 +600,11 @@ TEST_F(TuntapTest, PingKernel) {
   }
 }
 
+// A write larger than the largest IP packet fails. Linux takes such writes
+// (up to about 544 KiB) and drops the packet; gVisor does not allocate for it.
 TEST_F(TuntapTest, LargeWritesFailWithEMSGSIZE) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+  SKIP_IF(!IsRunningOnGvisor());
 
   const auto& [fd, link] = ASSERT_NO_ERRNO_AND_VALUE(OpenAndAttachTunTap(
       kTapName, kTapIPAddr, true /* tap */, false /* no_pi */));
@@ -610,7 +614,7 @@ TEST_F(TuntapTest, LargeWritesFailWithEMSGSIZE) {
   std::string arp_rep =
       CreateArpPacket(kMacB, kTapPeerIPAddr, kMacA, kTapIPAddr);
 
-  constexpr int kBufSize = 4096;
+  constexpr int kBufSize = 70000;
   std::vector<char> buf(kBufSize);
   struct iovec iov[2] = {
       {
@@ -623,7 +627,6 @@ TEST_F(TuntapTest, LargeWritesFailWithEMSGSIZE) {
       },
   };
 
-  // A packet is large than MTU which is 1500 by default..
   EXPECT_THAT(writev(fd.get(), iov, 2), SyscallFailsWithErrno(EMSGSIZE));
 }
 
@@ -707,6 +710,56 @@ TEST_F(TuntapTest, TUNNoPacketInfo) {
       break;
     }
   }
+}
+
+// A packet written to the device is received even if it is larger than the
+// interface MTU: the MTU limits only what the interface sends.
+TEST_F(TuntapTest, TUNWriteLargerThanMTU) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  const auto& [fd, link] = ASSERT_NO_ERRNO_AND_VALUE(OpenAndAttachTunTap(
+      kTunName, kTapIPAddr, false /* tap */, true /* no_pi */));
+  // A UDP packet of 2000 bytes from the peer to the interface address.
+  constexpr size_t kPacketSize = 2000;
+  ASSERT_LT(link.mtu, kPacketSize);
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(9000);
+  addr.sin_addr.s_addr = kTapIPAddr;
+  ASSERT_THAT(
+      bind(sock.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+      SyscallSucceeds());
+
+  constexpr size_t kPayloadSize = kPacketSize - sizeof(iphdr) - sizeof(udphdr);
+  std::vector<char> pkt(kPacketSize, 'a');
+  iphdr ip = {};
+  ip.ihl = 5;
+  ip.version = 4;
+  ip.tot_len = htons(kPacketSize);
+  ip.id = htons(1);
+  ip.frag_off = htons(IP_DF);
+  ip.ttl = 64;
+  ip.protocol = IPPROTO_UDP;
+  ip.saddr = kTapPeerIPAddr;
+  ip.daddr = kTapIPAddr;
+  ip.check = IPChecksum(ip);
+  udphdr udp = {};
+  udp.source = htons(9001);
+  udp.dest = htons(9000);
+  udp.len = htons(sizeof(udphdr) + kPayloadSize);
+  memcpy(pkt.data(), &ip, sizeof(ip));
+  memcpy(pkt.data() + sizeof(ip), &udp, sizeof(udp));
+
+  EXPECT_THAT(write(fd.get(), pkt.data(), pkt.size()),
+              SyscallSucceedsWithValue(kPacketSize));
+
+  struct pollfd pfd = {.fd = sock.get(), .events = POLLIN};
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, 5000), SyscallSucceedsWithValue(1));
+  std::vector<char> got(kPayloadSize + 1);
+  EXPECT_THAT(recv(sock.get(), got.data(), got.size(), MSG_DONTWAIT),
+              SyscallSucceedsWithValue(kPayloadSize));
 }
 
 // TCPBlockingConnectFailsArpResolution tests for TCP connect to fail on link

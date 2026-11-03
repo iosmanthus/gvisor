@@ -21,6 +21,7 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/socket/netstack",
         "//pkg/sentry/vfs",
+        "//pkg/tcpip/header",
         "//pkg/tcpip/link/tun",
         "//pkg/usermem",
         "//pkg/waiter",
