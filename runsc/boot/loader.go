@@ -249,9 +249,8 @@ type Loader struct {
 	// apply to the entire pod.
 	mountHints *sentryapi.PodMountHints
 
-	// productName is the value to show in
-	// /sys/devices/virtual/dmi/id/product_name.
-	productName string
+	// dmi holds the values to show in /sys/devices/virtual/dmi/id.
+	dmi DMIValues
 
 	// rdmaSysfs is the host sysfs snapshot for RDMA device topology, or
 	// nil when disabled.
@@ -533,6 +532,11 @@ type Args struct {
 	// ProductName is the value to show in
 	// /sys/devices/virtual/dmi/id/product_name.
 	ProductName string
+	// ProductUUID, ProductSerial and SysVendor are the values to show in the
+	// files of the same names in /sys/devices/virtual/dmi/id.
+	ProductUUID   string
+	ProductSerial string
+	SysVendor     string
 
 	// RDMASysfs is the host sysfs snapshot for RDMA device topology, or
 	// nil when disabled.
@@ -706,11 +710,16 @@ func New(args Args) (*Loader, error) {
 			enabled: args.NoRootContainer,
 			exit:    make(chan struct{}),
 		},
-		processes:             map[execID]*execProcess{eid: {}},
-		sharedMounts:          make(map[string]*vfs.Mount),
-		stopProfiling:         stopProfiling,
-		startupTimer:          args.StartupTimer,
-		productName:           args.ProductName,
+		processes:     map[execID]*execProcess{eid: {}},
+		sharedMounts:  make(map[string]*vfs.Mount),
+		stopProfiling: stopProfiling,
+		startupTimer:  args.StartupTimer,
+		dmi: DMIValues{
+			ProductName:   args.ProductName,
+			ProductUUID:   args.ProductUUID,
+			ProductSerial: args.ProductSerial,
+			SysVendor:     args.SysVendor,
+		},
 		rdmaSysfs:             args.RDMASysfs,
 		cpuQuota:              args.CPUQuota,
 		cpuPeriod:             args.CPUPeriod,

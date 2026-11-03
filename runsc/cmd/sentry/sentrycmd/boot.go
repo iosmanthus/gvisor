@@ -188,6 +188,12 @@ type Boot struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
 
+	// productUUID, productSerial and sysVendor are the values to show in the
+	// files of the same names in /sys/devices/virtual/dmi/id (--host-dmi).
+	productUUID   string
+	productSerial string
+	sysVendor     string
+
 	hostTHP boot.HostTHP
 
 	// FDs for profile data.
@@ -293,6 +299,9 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Uint64Var(&b.totalHostMem, "total-host-memory", 0, "total memory reported by host /proc/meminfo")
 	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
 	f.StringVar(&b.productName, "product-name", "", "value to show in /sys/devices/virtual/dmi/id/product_name")
+	f.StringVar(&b.productUUID, "product-uuid", "", "value to show in /sys/devices/virtual/dmi/id/product_uuid")
+	f.StringVar(&b.productSerial, "product-serial", "", "value to show in /sys/devices/virtual/dmi/id/product_serial")
+	f.StringVar(&b.sysVendor, "sys-vendor", "", "value to show in /sys/devices/virtual/dmi/id/sys_vendor")
 	f.StringVar(&b.hostTHP.ShmemEnabled, "host-thp-shmem-enabled", "", "value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host")
 	f.StringVar(&b.hostTHP.Defrag, "host-thp-defrag", "", "value of /sys/kernel/mm/transparent_hugepage/defrag on the host")
 	f.IntVar(&b.uid, "uid", 0, "user ID")
@@ -398,6 +407,28 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			b.productName = strings.TrimSpace(string(product))
 			log.Infof("Setting product_name: %q", b.productName)
 			argOverride["product-name"] = b.productName
+		}
+	}
+	if conf.HostDMI == config.HostDMIAll {
+		for _, f := range []struct {
+			file, flag string
+			dst        *string
+		}{
+			{"product_uuid", "product-uuid", &b.productUUID},
+			{"product_serial", "product-serial", &b.productSerial},
+			{"sys_vendor", "sys-vendor", &b.sysVendor},
+		} {
+			if len(*f.dst) != 0 {
+				continue
+			}
+			v, err := os.ReadFile("/sys/devices/virtual/dmi/id/" + f.file)
+			if err != nil {
+				log.Infof("Not setting %s: %v", f.file, err)
+				continue
+			}
+			*f.dst = strings.TrimSpace(string(v))
+			log.Infof("Setting %s from the host", f.file)
+			argOverride[f.flag] = *f.dst
 		}
 	}
 	if conf.AppHugePages {
@@ -729,6 +760,9 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		UserLogFD:           b.userLogFD,
 		RDMASysfs:           rdmaSnap,
 		ProductName:         b.productName,
+		ProductUUID:         b.productUUID,
+		ProductSerial:       b.productSerial,
+		SysVendor:           b.sysVendor,
 		PodInitConfigFD:     b.podInitConfigFD,
 		SinkFDs:             b.sinkFDs.GetArray(),
 		ProfileOpts:         profile.MakeOpts(&b.profileFDs, conf.ProfileGCInterval),

@@ -663,3 +663,49 @@ func TestRDMASysfs(t *testing.T) {
 		t.Errorf("reading speed of a down link returned %v, want EINVAL", err)
 	}
 }
+
+func TestDMIFiles(t *testing.T) {
+	s := newTestSystemWithInternalData(t, &sys.InternalData{
+		ProductName:   "Test Product",
+		ProductUUID:   "a1b2c3d4-0000-1111-2222-333344445555",
+		ProductSerial: "SN123",
+		SysVendor:     "Test Vendor",
+	})
+	defer s.Destroy()
+	for _, f := range []struct {
+		name, want string
+		mode       linux.FileMode
+	}{
+		{"product_name", "Test Product\n", 0444},
+		{"product_uuid", "a1b2c3d4-0000-1111-2222-333344445555\n", 0400},
+		{"product_serial", "SN123\n", 0400},
+		{"sys_vendor", "Test Vendor\n", 0444},
+	} {
+		pop := s.PathOpAtRoot("devices/virtual/dmi/id/" + f.name)
+		stat, err := s.VFS.StatAt(s.Ctx, s.Creds, pop, &vfs.StatOptions{Mask: linux.STATX_MODE})
+		if err != nil {
+			t.Fatalf("stat %s: %v", f.name, err)
+		}
+		if got := linux.FileMode(stat.Mode).Permissions(); got != f.mode {
+			t.Errorf("%s mode = %o, want %o", f.name, got, f.mode)
+		}
+		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+		if err != nil {
+			t.Fatalf("open %s: %v", f.name, err)
+		}
+		got, err := s.ReadToEnd(fd)
+		fd.DecRef(s.Ctx)
+		if err != nil || got != f.want {
+			t.Errorf("%s = %q, %v; want %q", f.name, got, err, f.want)
+		}
+	}
+}
+
+func TestDMIFilesAbsent(t *testing.T) {
+	s := newTestSystemWithInternalData(t, &sys.InternalData{ProductName: "P"})
+	defer s.Destroy()
+	pop := s.PathOpAtRoot("devices/virtual/dmi/id/product_uuid")
+	if _, err := s.VFS.StatAt(s.Ctx, s.Creds, pop, &vfs.StatOptions{}); err == nil {
+		t.Errorf("product_uuid exists without a value")
+	}
+}

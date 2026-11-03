@@ -57,6 +57,11 @@ type FilesystemType struct{}
 type InternalData struct {
 	// ProductName is the value to be set to devices/virtual/dmi/id/product_name.
 	ProductName string
+	// ProductUUID, ProductSerial and SysVendor are the values of the files of
+	// the same names in devices/virtual/dmi/id. An empty value gives no file.
+	ProductUUID   string
+	ProductSerial string
+	SysVendor     string
 	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
 	// accelerators.
 	EnableTPUProxyPaths bool
@@ -79,10 +84,14 @@ type filesystem struct {
 	devMinor            uint32
 	enableTPUProxyPaths bool
 	testSysfsPathPrefix string
-	// productName is the value of devices/virtual/dmi/id/product_name. If
+	// productName, productUUID, productSerial and sysVendor are the values
+	// of the files of the same names in devices/virtual/dmi/id. If all are
 	// empty, the DMI directories are not created.
-	productName string
-	root        *dir
+	productName   string
+	productUUID   string
+	productSerial string
+	sysVendor     string
+	root          *dir
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -144,6 +153,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if opts.InternalData != nil {
 		idata := opts.InternalData.(*InternalData)
 		fs.productName = idata.ProductName
+		fs.productUUID = idata.ProductUUID
+		fs.productSerial = idata.ProductSerial
+		fs.sysVendor = idata.SysVendor
 		if idata.EnableTPUProxyPaths {
 			fs.enableTPUProxyPaths = true
 			fs.testSysfsPathPrefix = idata.TestSysfsPathPrefix
@@ -250,20 +262,29 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 }
 
 // addDMIDirs adds the DMI entries to classSub (/sys/class) and devicesSub
-// (/sys/devices) if fs.productName is set.
+// (/sys/devices) if any DMI value is set.
 func (fs *filesystem) addDMIDirs(ctx context.Context, creds *auth.Credentials, classSub, devicesSub map[string]kernfs.Inode) {
-	if len(fs.productName) == 0 {
+	files := make(map[string]kernfs.Inode)
+	add := func(name, value string, mode linux.FileMode) {
+		if value != "" {
+			files[name] = fs.newStaticFile(ctx, creds, mode, value+"\n")
+		}
+	}
+	add("product_name", fs.productName, defaultSysMode)
+	add("sys_vendor", fs.sysVendor, defaultSysMode)
+	// As in Linux, only root can read the identifiers.
+	add("product_uuid", fs.productUUID, 0400)
+	add("product_serial", fs.productSerial, 0400)
+	if len(files) == 0 {
 		return
 	}
-	log.Debugf("Setting product_name: %q", fs.productName)
+	log.Debugf("Setting DMI files: %d", len(files))
 	classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
 	})
 	devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, fs.productName+"\n"),
-			}),
+			"id": fs.newDir(ctx, creds, defaultSysDirMode, files),
 		}),
 	})
 }

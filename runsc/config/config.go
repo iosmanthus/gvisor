@@ -488,6 +488,10 @@ type Config struct {
 	// with the SUID/SGID bits set.
 	AllowSUID bool `flag:"allow-suid"`
 
+	// HostDMI selects which of the host's DMI values the sandbox sysfs shows
+	// besides product_name.
+	HostDMI HostDMIPolicy `flag:"host-dmi"`
+
 	// UseCPUNums causes the sentry to use KVM CPU numbers as CPU numbers in the
 	// sentry. This is necessary to support features like rseq.
 	UseCPUNums bool `flag:"kvm-use-cpu-nums"`
@@ -1485,6 +1489,56 @@ func (o *Overlay2) SubMountOverlaySize() string {
 // Medium returns the overlay medium config.
 func (o Overlay2) Medium() OverlayMedium {
 	return o.medium
+}
+
+// HostDMIPolicy selects the host DMI values that the sandbox sysfs shows in
+// /sys/devices/virtual/dmi/id besides product_name.
+type HostDMIPolicy int
+
+// HostDMIPolicy values.
+const (
+	// HostDMINone shows no other host DMI value.
+	HostDMINone HostDMIPolicy = iota
+
+	// HostDMIAll also shows product_uuid, product_serial and sys_vendor.
+	// They identify the host; product_uuid and product_serial are readable
+	// by root only, as in Linux.
+	HostDMIAll
+)
+
+// Set implements flag.Value.Set.
+func (p *HostDMIPolicy) Set(v string) error {
+	switch v {
+	case "none":
+		*p = HostDMINone
+	case "all":
+		*p = HostDMIAll
+	default:
+		return fmt.Errorf("invalid host DMI policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to p.
+func (p HostDMIPolicy) Ptr() *HostDMIPolicy {
+	return &p
+}
+
+// Get implements flag.Value.Get.
+func (p *HostDMIPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.Value.String.
+func (p HostDMIPolicy) String() string {
+	switch p {
+	case HostDMINone:
+		return "none"
+	case HostDMIAll:
+		return "all"
+	default:
+		panic(fmt.Sprintf("invalid host DMI policy %d", p))
+	}
 }
 
 // HostSettingsPolicy dictates how host settings should be handled.
