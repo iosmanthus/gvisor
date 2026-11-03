@@ -1640,6 +1640,8 @@ func (r Route) Equal(to Route) bool {
 
 // Rule is a policy routing rule with the Linux action FR_ACT_TO_TBL: a packet
 // that matches the selectors is routed with the route table Table.
+//
+// +stateify savable
 type Rule struct {
 	// Priority orders the rules; the lowest value is tried first.
 	Priority uint32

@@ -18,29 +18,37 @@
 #include <linux/fib_rules.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
+#include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <poll.h>
 #include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/syscalls/linux/socket_netlink_route_util.h"
 #include "test/syscalls/linux/socket_netlink_util.h"
-#include "test/util/capability_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 
@@ -109,23 +117,23 @@ void FlushRules() {
 // the sandbox's namespace: its tun devices, and their routes, go away when it
 // exits, and it removes the rules an earlier test left.
 void InNewNetns(const std::function<void()>& fn) {
-  EXPECT_THAT(InForkedProcess([&] {
-                if (IsRunningOnGvisor()) {
-                  FlushRules();
-                } else {
-                  TEST_PCHECK(unshare(CLONE_NEWNET) == 0);
-                }
-                Link lo = TEST_CHECK_NO_ERRNO_AND_VALUE(LoopbackLink());
-                TEST_CHECK_NO_ERRNO(LinkChangeFlags(lo.index, IFF_UP, IFF_UP));
-                // Forwarding on; no reverse-path filter (Linux only files).
-                SetContents("/proc/sys/net/ipv4/ip_forward", "1").IgnoreError();
-                SetContents("/proc/sys/net/ipv4/conf/all/rp_filter", "0")
-                    .IgnoreError();
-                SetContents("/proc/sys/net/ipv4/conf/default/rp_filter", "0")
-                    .IgnoreError();
-                fn();
-              }),
-              IsPosixErrorOkAndHolds(0));
+  EXPECT_THAT(
+      InForkedProcess([&] {
+        if (IsRunningOnGvisor()) {
+          FlushRules();
+        } else {
+          TEST_PCHECK(unshare(CLONE_NEWNET) == 0);
+        }
+        Link lo = TEST_CHECK_NO_ERRNO_AND_VALUE(LoopbackLink());
+        TEST_CHECK_NO_ERRNO(LinkChangeFlags(lo.index, IFF_UP, IFF_UP));
+        // Forwarding on; no reverse-path filter (Linux only files).
+        SetContents("/proc/sys/net/ipv4/ip_forward", "1").IgnoreError();
+        SetContents("/proc/sys/net/ipv4/conf/all/rp_filter", "0").IgnoreError();
+        SetContents("/proc/sys/net/ipv4/conf/default/rp_filter", "0")
+            .IgnoreError();
+        fn();
+      }),
+      IsPosixErrorOkAndHolds(0));
 }
 
 // GetLinkByName returns the link named name.
@@ -156,7 +164,8 @@ Tun MakeTun(const char* name, const char* addr, int prefix) {
   TEST_CHECK_NO_ERRNO(LinkChangeFlags(link.index, IFF_UP, IFF_UP));
   struct in_addr a;
   TEST_CHECK(inet_pton(AF_INET, addr, &a) == 1);
-  FileDescriptor nl = TEST_CHECK_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  FileDescriptor nl =
+      TEST_CHECK_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   TEST_CHECK_NO_ERRNO(
       LinkAddLocalAddr(nl, link.index, AF_INET, prefix, &a, sizeof(a)));
   return {fd, link.index};
@@ -215,7 +224,8 @@ bool ReadsUDPTo(int fd, const char* dst) {
 // iif <iif> lookup <table> priority <prio>"; src may be nullptr and iif "".
 void ModifyRule(uint16_t type, const char* src, int len, const char* iif,
                 int table, int prio) {
-  FileDescriptor fd = TEST_CHECK_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  FileDescriptor fd =
+      TEST_CHECK_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   struct {
     struct nlmsghdr hdr;
     struct fib_rule_hdr rule;
@@ -232,8 +242,8 @@ void ModifyRule(uint16_t type, const char* src, int len, const char* iif,
   req.rule.table = table;
   req.rule.action = FR_ACT_TO_TBL;
   auto add = [&](uint16_t type, const void* data, size_t n) {
-    auto* a = reinterpret_cast<struct rtattr*>(
-        reinterpret_cast<char*>(&req) + NLMSG_ALIGN(req.hdr.nlmsg_len));
+    auto* a = reinterpret_cast<struct rtattr*>(reinterpret_cast<char*>(&req) +
+                                               NLMSG_ALIGN(req.hdr.nlmsg_len));
     a->rta_type = type;
     a->rta_len = RTA_LENGTH(n);
     memcpy(RTA_DATA(a), data, n);
@@ -258,7 +268,8 @@ void AddRule(const char* src, int len, const char* iif, int table, int prio) {
 
 // AddDefaultRoute adds "default dev <index> table <table>".
 void AddDefaultRoute(int index, int table) {
-  FileDescriptor fd = TEST_CHECK_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  FileDescriptor fd =
+      TEST_CHECK_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   struct {
     struct nlmsghdr hdr;
     struct rtmsg rt;
@@ -273,8 +284,8 @@ void AddDefaultRoute(int index, int table) {
   req.rt.rtm_protocol = RTPROT_BOOT;
   req.rt.rtm_scope = RT_SCOPE_LINK;
   req.rt.rtm_type = RTN_UNICAST;
-  auto* a = reinterpret_cast<struct rtattr*>(
-      reinterpret_cast<char*>(&req) + NLMSG_ALIGN(req.hdr.nlmsg_len));
+  auto* a = reinterpret_cast<struct rtattr*>(reinterpret_cast<char*>(&req) +
+                                             NLMSG_ALIGN(req.hdr.nlmsg_len));
   a->rta_type = RTA_OIF;
   a->rta_len = RTA_LENGTH(sizeof(int));
   memcpy(RTA_DATA(a), &index, sizeof(int));
@@ -296,6 +307,8 @@ TEST(PolicyRoutingTest, ForwardedBySource) {
     WriteUDP(in.fd, "192.0.2.5", "198.51.100.7");
     TEST_CHECK(!ReadsUDPTo(out.fd, "198.51.100.7"));
     AddRule("192.0.2.0", 24, "", 100, 100);
+    // Rules and the routes of other tables survive save and restore.
+    MaybeSave();
     WriteUDP(in.fd, "192.0.2.5", "198.51.100.7");
     TEST_CHECK(ReadsUDPTo(out.fd, "198.51.100.7"));
     // A source outside 192.0.2.0/24 does not match; main has no route.
@@ -365,7 +378,7 @@ TEST(PolicyRoutingTest, PriorityOrder) {
     Tun b = MakeTun("pr-b", "198.18.0.1", 24);
     AddDefaultRoute(a.index, 100);
     AddDefaultRoute(b.index, 200);
-    AddRule("192.0.2.0", 24, "", 200, 50);   // wins: lower priority value
+    AddRule("192.0.2.0", 24, "", 200, 50);  // wins: lower priority value
     AddRule("192.0.2.0", 24, "", 100, 100);
     WriteUDP(in.fd, "192.0.2.5", "198.51.100.7");
     TEST_CHECK(ReadsUDPTo(b.fd, "198.51.100.7"));

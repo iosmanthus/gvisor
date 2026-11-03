@@ -105,8 +105,9 @@ PosixError DelLookupInTableRule(int family, int table, int priority,
                                 int prefixlen, const void* dst, int dstlen);
 
 // DumpRoutes calls fn on each RTM_NEWROUTE message of a route dump of family.
-PosixError DumpRoutes(const FileDescriptor& fd, int family,
-                      const std::function<void(const struct nlmsghdr* hdr)>& fn);
+PosixError DumpRoutes(
+    const FileDescriptor& fd, int family,
+    const std::function<void(const struct nlmsghdr* hdr)>& fn);
 
 // RouteTable returns the table of a route message; RTA_TABLE wins over
 // rtm_table, as in Linux.

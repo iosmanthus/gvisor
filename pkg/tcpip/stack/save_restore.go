@@ -29,11 +29,18 @@ func (s *Stack) beforeSave() {
 	s.mu.Lock()
 	s.routeMu.RLock()
 	s.preservedRoutes = nil
-	for r := s.routeTable.Front(); r != nil; r = r.Next() {
-		if _, ok := s.preservedNICs[r.NIC]; ok {
-			rCopy := *r
-			rCopy.RouteEntry = tcpip.RouteEntry{}
-			s.preservedRoutes = append(s.preservedRoutes, rCopy)
+	// Routes keep their table, so restore puts them back where they were.
+	lists := []*tcpip.RouteList{&s.routeTable}
+	for _, id := range s.otherTableIDsLocked() {
+		lists = append(lists, s.routeTables[id])
+	}
+	for _, list := range lists {
+		for r := list.Front(); r != nil; r = r.Next() {
+			if _, ok := s.preservedNICs[r.NIC]; ok {
+				rCopy := *r
+				rCopy.RouteEntry = tcpip.RouteEntry{}
+				s.preservedRoutes = append(s.preservedRoutes, rCopy)
+			}
 		}
 	}
 	s.routeMu.RUnlock()

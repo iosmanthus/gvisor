@@ -3160,8 +3160,8 @@ TEST(NetlinkRouteTest, RouteInTable) {
     char buf[64];
   } req = {};
   auto add_attr = [&](uint16_t type, const void* data, size_t len) {
-    auto* a = reinterpret_cast<struct rtattr*>(
-        reinterpret_cast<char*>(&req) + NLMSG_ALIGN(req.hdr.nlmsg_len));
+    auto* a = reinterpret_cast<struct rtattr*>(reinterpret_cast<char*>(&req) +
+                                               NLMSG_ALIGN(req.hdr.nlmsg_len));
     a->rta_type = type;
     a->rta_len = RTA_LENGTH(len);
     memcpy(RTA_DATA(a), data, len);
@@ -3202,8 +3202,7 @@ TEST(NetlinkRouteTest, RouteInTable) {
   // The same prefix in main is a separate route.
   build(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, RT_TABLE_MAIN);
   ASSERT_NO_ERRNO(NetlinkRequestAckOrError(fd, 1, &req, req.hdr.nlmsg_len));
-  EXPECT_THAT(tables(),
-              ::testing::UnorderedElementsAre(kTable, RT_TABLE_MAIN));
+  EXPECT_THAT(tables(), ::testing::UnorderedElementsAre(kTable, RT_TABLE_MAIN));
 
   // Deleting it from main leaves table 100 alone.
   build(RTM_DELROUTE, 0, RT_TABLE_MAIN);
